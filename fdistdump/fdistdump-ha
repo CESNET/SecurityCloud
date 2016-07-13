@@ -1,0 +1,421 @@
+#!/usr/bin/env python3
+
+#author: Jan Wrona, wrona@cesnet.cz
+
+# Copyright (C) 2015 CESNET
+#
+# LICENSE TERMS
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in
+#    the documentation and/or other materials provided with the
+#    distribution.
+# 3. Neither the name of the Company nor the names of its contributors
+#    may be used to endorse or promote products derived from this
+#    software without specific prior written permission.
+#
+# ALTERNATIVELY, provided that this notice is retained in full, this
+# product may be distributed under the terms of the GNU General Public
+# License (GPL) version 2 or later, in which case the provisions
+# of the GPL apply INSTEAD OF those given above.
+#
+# This software is provided ``as is'', and any express or implied
+# warranties, including, but not limited to, the implied warranties of
+# merchantability and fitness for a particular purpose are disclaimed.
+# In no event shall the company or contributors be liable for any
+# direct, indirect, incidental, special, exemplary, or consequential
+# damages (including, but not limited to, procurement of substitute
+# goods or services; loss of use, data, or profits; or business
+# interruption) however caused and on any theory of liability, whether
+# in contract, strict liability, or tort (including negligence or
+# otherwise) arising in any way out of the use of this software, even
+# if advised of the possibility of such damage.
+
+
+import subprocess, re, time, os.path, argparse, warnings
+import shutil, shlex
+
+
+MONITOR_INTERVAL = 1 #seconds
+DOWN_LIMIT = 3 #times MONITOR_INTERVAL
+
+binaries = {
+    'mpi': 'mpiexec',
+    'fdistdump': 'fdistdump',
+    'node': 'crm_node',
+    'mon': 'crm_mon',
+    'attribute': 'crm_attribute'
+}
+
+
+####################################################################################################
+def myformatwarning(message, category, filename, lineno, line=None):
+    return 'Warning: {}\n'.format(str(message))
+
+
+def get_nodes_names():
+    """
+    crm_node: tool for displaying low-level node information
+        --list: print all known members (past and present) of this cluster
+
+    output:
+        <ID> <NAME> member
+        ...
+
+    return:
+        list of tuples (integer ID, string name)
+    """
+
+    args = [binaries['node'], '--list']
+    proc = subprocess.Popen(args, stdout = subprocess.PIPE, stderr = subprocess.PIPE, universal_newlines = True)
+    stdout_str, stderr_str = proc.communicate()
+    ret_code = proc.wait()
+
+    if ret_code != 0 or stderr_str:
+        err_str = '\ncommand: ' + ' '.join(args) + '\nreturn code: ' + str(ret_code) + '\nstderr:\n' + stderr_str
+        raise subprocess.SubprocessError(err_str)
+
+    node_list = []
+    for match in re.findall(r'(\d+)\s+(\S+)', stdout_str):
+        node_list.append((int(match[0]), match[1]))
+
+    return node_list
+
+
+def get_nodes_status():
+    """
+    crm_mon: provides a summary of cluster's current state (online, offline, standby, ...)
+        --group-by-node: group resources by node
+        --hide-headers: hide all headers (good for parsing)
+        --show-detail: show more details (node IDs, individual clone instances)
+        --one-shot: display the cluster status once on the console and exit (no ncurses)
+
+    output:
+        Node <NAME> (<ID>): <STATUS>
+        ...
+
+    return:
+        list of tuples (integer ID, string status)
+    """
+
+    args = [binaries['mon'], '--group-by-node', '--hide-headers', '--show-detail', '--one-shot']
+    proc = subprocess.Popen(args, stdout = subprocess.PIPE, stderr = subprocess.PIPE, universal_newlines = True)
+    stdout_str, stderr_str = proc.communicate()
+    ret_code = proc.wait()
+
+    if ret_code != 0 or stderr_str:
+        err_str = '\ncommand: ' + ' '.join(args) + '\nreturn code: ' + str(ret_code) + '\nstderr:\n' + stderr_str
+        raise subprocess.SubprocessError(err_str)
+
+    nodes_status = []
+    for match in re.findall(r'Node\s+\S+\s+\((\d+)\):\s+(\w+)', stdout_str):
+        nodes_status.append((int(match[0]), match[1]))
+
+    return nodes_status
+
+
+def get_cluster_attribute(attribute_name, node_name = None):
+    """
+    crm_attribute: manage node's attributes and cluster options
+        --query: query the current value of the attribute/option
+        --name=NAME: name of the attribute/option to operate on
+        --node=NODE: get an attribute for the named node (instead of a cluster option)
+
+    output:
+        scope=nodes  name=<ATTRIBUTE> value=<NODE>
+
+    return:
+        attribute value as string or None if no such attribute is set
+    """
+
+    args = [binaries['attribute'], '--query', '--name={}'.format(attribute_name)]
+    if node_name:
+        args.append('--node={}'.format(node_name))
+    proc = subprocess.Popen(args, stdout = subprocess.PIPE, stderr = subprocess.PIPE, universal_newlines = True)
+    stdout_str, stderr_str = proc.communicate()
+    ret_code = proc.wait()
+
+    if ret_code == 1:
+        raise subprocess.SubprocessError(stderr_str) #no node of such name
+    elif ret_code == 6 and stderr_str == 'Error performing operation: No such device or address\n':
+        return #no attribute of such name, return None
+    elif ret_code != 0 or stderr_str:
+        err_str = '\ncommand: ' + ' '.join(args) + '\nreturn code: ' + str(ret_code) + '\nstderr:\n' + stderr_str
+        raise subprocess.SubprocessError(err_str)
+
+    match = re.fullmatch(r'scope={}\s+name={}\s+value=(\S+)\n'.format('nodes' if node_name else 'crm_config', attribute_name), stdout_str)
+    if not match:
+        err_str = '\ncommand: ' + ' '.join(args) + '\nbad output:\n' + stdout_str
+        raise subprocess.SubprocessError(err_str)
+
+    return match.group(1)
+
+
+def load_nodes_dict():
+    """
+    {
+        ID: {
+                'name': NAME,
+                'successor': ID #only for subcollectors
+            }
+
+        ID: ...
+    }
+    """
+
+    nodes_dict = {}
+    id_names = get_nodes_names()
+    ids = set()
+
+    for id, name in id_names:
+        nodes_dict[id] = {'name': name}
+        ids.add(id)
+
+    for id, name in id_names:
+        succ_id = get_cluster_attribute('successor', name)
+        if succ_id is None:
+            continue #no successor attribute means node is not subcollector
+
+        succ_id = int(succ_id)
+        if succ_id not in ids:
+            raise KeyError('node {} has invalid successor id {}'.format(id, succ_id))
+        else:
+            nodes_dict[id]['successor'] = succ_id
+
+    return nodes_dict
+
+
+def load_setup_dict():
+    """Return dictionary with certain cluster parameters."""
+
+    setup_dict = {}
+
+    setup_dict['primary_brick_path'] = get_cluster_attribute('primary_brick_path')
+    setup_dict['secondary_brick_path'] = get_cluster_attribute('secondary_brick_path')
+    setup_dict['gluster_mount_path'] = get_cluster_attribute('gluster_mount_path')
+
+    return setup_dict
+
+
+def get_master_set(nodes_dict):
+    """Return set of master nodes."""
+
+    masters = set()
+    for key, value in nodes_dict.items():
+        if 'successor' not in value:
+            masters.add(key)
+
+    return masters
+
+
+def get_subcollector_set(nodes_dict):
+    """Return set of subcollector nodes."""
+
+    subcollectors = set()
+    for key, value in nodes_dict.items():
+        if 'successor' in value:
+            subcollectors.add(key)
+
+    return subcollectors
+
+
+def get_online_set():
+    """Return set of online nodes."""
+
+    online_set = set()
+    for id, status in get_nodes_status():
+        if status == 'online':
+            online_set.add(id)
+
+    return online_set
+
+
+def graph_check_validity(nodes_dict):
+    """Check validity of the topology graph."""
+
+    subcoll_set = get_subcollector_set(nodes_dict)
+
+    if len(subcoll_set) == 0:
+        print('Error: empty subcollector set.')
+        return False
+
+    first_id = node_id = subcoll_set.pop()
+    succ_id = nodes_dict[node_id]['successor']
+
+    if node_id == succ_id:
+        warnings.warn('Self-loop doesn\'t make sense.')
+        return True
+
+    while succ_id in subcoll_set:
+        subcoll_set.remove(succ_id)
+        node_id = succ_id
+        succ_id = nodes_dict[node_id]['successor']
+
+    if succ_id != first_id or len(subcoll_set) != 0:
+        print('Error: invalid subcollector graph.')
+        return False
+    else:
+        return True
+
+
+def graph_print(nodes_dict):
+    """Print VALID topology graph."""
+
+    subcoll_set = get_subcollector_set(nodes_dict)
+    str_len = 0
+
+    #find first node
+    curr_id = subcoll_set.pop()
+    succ_id = nodes_dict[curr_id]['successor']
+    graph_str = '--> ' + nodes_dict[curr_id]['name']
+
+    while succ_id in subcoll_set:
+        subcoll_set.remove(succ_id)
+        curr_id = succ_id
+        succ_id = nodes_dict[curr_id]['successor']
+        graph_str += ' --> ' + nodes_dict[curr_id]['name']
+
+    bottom_line = '_' * len(graph_str)
+    graph_str += '--'
+    print(graph_str)
+    print('|' + bottom_line + '|')
+
+
+def construct_hosts_and_paths(nodes_dict, setup_dict):
+    """
+    """
+
+    master_name = ''
+    slave_names = []
+    paths = []
+
+    online_set = get_online_set()
+    master_set = get_master_set(nodes_dict)
+    subcollector_set = get_subcollector_set(nodes_dict)
+
+    #choose best master node
+    for master in master_set:
+        if master in online_set: #have dedicated master node
+            master_name = nodes_dict[master]['name']
+            break
+    else: #no dedicated master found, choose arbitrary subcollector node as master
+        for sub in subcollector_set:
+            if sub in online_set:
+                    master_name = nodes_dict[sub]['name']
+                    break
+        else: #no master found at all
+            raise Exception('no node suitable for master found')
+
+
+    #at least one online subcollector is mandatory
+    if subcollector_set.isdisjoint(online_set):
+        raise Exception('no online subcollector found')
+
+    #add all online subcollector nodes as slaves
+    for sub in subcollector_set:
+        if sub in online_set:
+            slave_names.append(nodes_dict[sub]['name'])
+
+    #handle all not online subcollector nodes
+    for sub in subcollector_set:
+        if sub not in online_set:
+            sub_name = nodes_dict[sub]['name']
+            succ = nodes_dict[sub]['successor']
+            succ_name = nodes_dict[succ]['name']
+
+            warn_msg = 'Node {} ({}) isn\'t online, '.format(sub, sub_name)
+            if succ in online_set: #is successor online?
+                paths.append(os.path.join('%{}:'.format(slave_names.index(succ_name) + 1) + \
+                                setup_dict['secondary_brick_path'], sub_name))
+                warn_msg += 'using successor {} ({}) as a backup.'.format(succ, succ_name)
+                warnings.warn(warn_msg)
+            else: #successor is offline, data set will be incomplete
+                warn_msg += 'its successor {} ({}) also isn\'t online. '.format(succ, succ_name)
+                warn_msg += 'Data set is incomplete!'
+                warnings.warn(warn_msg)
+
+    slave_names.insert(0, master_name) #prepend master node to slaves
+    paths.append(os.path.join(setup_dict['primary_brick_path'], '%h'))#append global primary path
+
+    return (slave_names, paths)
+
+
+####################################################################################################
+if __name__ == "__main__":
+    #check presence of used binaries
+    for key, value in binaries.items():
+        if shutil.which(value) is None:
+            raise OSError('Executable "{}" not found.'.format(value))
+
+    #set my format for warning
+    warnings.formatwarning = myformatwarning
+
+    #parse command line arguments
+    parser = argparse.ArgumentParser(description ='Pacemaker HA fdistdump launcher.')
+    parser.add_argument('--mpi-args', dest = 'mpi_user_args')
+    parser.add_argument('--fdistdump-args', dest = 'fdistdump_user_args')
+    parser.add_argument('path', nargs='+')
+    args = parser.parse_args()
+
+    #initialize dictionaries
+    setup_dict = load_setup_dict()
+    nodes_dict = load_nodes_dict()
+
+    #check topology graph
+    if not graph_check_validity(nodes_dict):
+        exit(1)
+
+    #get the set of online nodes and construct hosts and appropriate paths
+    online_set_ref = get_online_set()
+    hosts, base_paths = construct_hosts_and_paths(nodes_dict, setup_dict)
+
+
+    #TODO: shud I strip initial slashes in user paths?
+    final_paths = []
+    for base_path in base_paths:
+        final_paths += [shlex.quote(os.path.join(base_path, user_path)) for user_path in args.path]
+
+    mpi_args = [binaries['mpi'], '-host', ','.join(hosts)] #comma separated list of hosts on which to invoke processes
+    if args.mpi_user_args:
+        mpi_args += shlex.split(args.mpi_user_args)
+
+    fdistdump_args = [binaries['fdistdump']]
+    if args.fdistdump_user_args:
+        fdistdump_args += shlex.split(args.fdistdump_user_args)
+
+    fdistdump_args += final_paths
+
+    print(mpi_args, fdistdump_args)
+    proc = subprocess.Popen(mpi_args + fdistdump_args)
+
+
+    #start monitoring loop
+    node_down_for = 0 #seconds
+    while proc.poll() is None:
+        if online_set_ref > get_online_set():
+            node_down_for += 1
+            warn_msg = '{}/{}: one or more nodes where query is running went offline.'.format(node_down_for, DOWN_LIMIT)
+            warnings.warn(warn_msg)
+        elif node_down_for != 0:
+            warn_msg = 'All nodes where query is running are back online.'
+            warnings.warn(warn_msg)
+            node_down_for = 0
+
+        if node_down_for >= DOWN_LIMIT:
+            warnings.warn('Terminating query.')
+            proc.terminate()
+            proc.wait(5)
+            break
+
+        time.sleep(MONITOR_INTERVAL)
+
+
+    if proc.returncode != 0:
+        warnings.warn('MPI process manager returned {}.'.format(proc.returncode))
+    else:
+        exit(proc.returncode)
