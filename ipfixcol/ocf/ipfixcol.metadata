@@ -1,0 +1,76 @@
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="ipfixcol">
+        <version>0.1</version>
+
+        <longdesc lang="en">
+                This is an ipfixcol OCF resource agent.
+                The ipfixcol is an IPFIX collector, part of IPFIXcol framework.
+                The collector uses input and output plugins to receive and store data.
+        </longdesc>
+        <shortdesc lang="en">IPFIXcol resource agent.</shortdesc>
+
+        <parameters>
+                <parameter name="role" unique="1" required="1">
+                        <longdesc lang="en">
+                                IPFIXcol role. Possible values are "proxy" or "subollector".
+                                Both roles may be running simultaneously on one machine,
+                                this parameter is used to distinguish them.
+                        </longdesc>
+                        <shortdesc lang="en">IPFIXcol role. Proxy or subcollector.</shortdesc>
+                        <content type="string" />
+                </parameter>
+
+                <parameter name="startup_conf" unique="1" required="0">
+                        <longdesc lang="en">
+                                Read startup configuration from this file.
+                        </longdesc>
+                        <shortdesc lang="en">Startup configuration file.</shortdesc>
+                        <content type="string" default="" />
+                </parameter>
+
+                <parameter name="internal_conf" unique="1" required="0">
+                        <longdesc lang="en">
+                                Read internal configuration from this file.
+                        </longdesc>
+                        <shortdesc lang="en">Internal configuration file.</shortdesc>
+                        <content type="string" default="" />
+                </parameter>
+
+                <parameter name="ipfix_elements" unique="1" required="0">
+                        <longdesc lang="en">
+                                Read set of IPFIX elements from this file.
+                        </longdesc>
+                        <shortdesc lang="en">IPFIX elements file.</shortdesc>
+                        <content type="string" default="" />
+                </parameter>
+
+                <parameter name="verbosity" unique="1" required="0">
+                        <longdesc lang="en">
+                                Set ipfixcol verbosity level to level.
+                                The higher the number, the more information is printed.
+                                Level 0 shows only errors, level 1 shows warnings,
+                                level 2 shows notices, level 3 shows debug messages.
+                        </longdesc>
+                        <shortdesc lang="en">Verbosity level.</shortdesc>
+                        <content type="integer" default="0" />
+                </parameter>
+
+                <parameter name="additional_args" unique="1" required="0">
+                        <longdesc lang="en">
+                                Any valid additional IPFIXcol arguments.
+                        </longdesc>
+                        <shortdesc lang="en">Additional arguments.</shortdesc>
+                        <content type="string" default="0" />
+                </parameter>
+        </parameters>
+
+        <actions>
+                <action name="start" timeout="20" />
+                <action name="stop" timeout="20" />
+                <action name="monitor" timeout="20" interval="10" depth="0" />
+                <action name="meta-data" timeout="5" />
+                <action name="validate-all" timeout="5" />
+        </actions>
+
+</resource-agent>
