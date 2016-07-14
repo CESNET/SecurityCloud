@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ipfix xmlns="urn:ietf:params:xml:ns:yang:ietf-ipfix-psamp">
+
+	<!--## Every collecting process will be started as new process -->
+	<collectingProcess>
+		<!--## Arbitrary collecting process name  -->
+		<name>TCP collector</name>
+		<!--## Type of the collector. Supported types are defined in internalcfg.xml -->
+		<tcpCollector>
+			<!--## Arbitrary udp collector name -->
+			<name>Listening port 4739</name>
+			<!--## Local listening port -->
+			<localPort>4739</localPort>
+			<!--## Local address to listen on. If empty, bind to all interfaces -->
+			<localIPAddress></localIPAddress>
+		</tcpCollector>
+		<!--## Name of the exporting process. Must match exporting process name -->
+		<exportingProcess>File writer</exportingProcess>
+	</collectingProcess>
+    
+    <!--## Exporting process configuration -->
+	<exportingProcess>
+		<!--## Name of the exporting process, must match <exportingProcess> element
+			   in <collectingProcess> -->
+		<name>File writer</name>
+
+		<!--## Specification of storage plugin -->
+		<destination>			
+			<!--## Arbitrary name -->
+			<name>JSON storage plugin</name>
+			<fileWriter>
+				<!--## Plugin (internal plugin identification) -->
+				<fileFormat>json</fileFormat>
+
+				<!--## TCP flags format - formated e.g. ".AP.SF" -->
+				<tcpFlags>formated</tcpFlags>
+				<!--## Timestamp format - formated e.g. "2015-08-03T14:10:20.012" -->
+				<timestamp>formated</timestamp>
+				<!--## Protocol identication format - formated e.g. "TCP" -->
+				<protocol>formated</protocol>
+				<!--## Ignore flow elements with unknown semantics -->
+				<ignoreUnknown>no</ignoreUnknown>
+				<!--## Convert non-printable characters (tab, newline, etc.) -->
+				<nonPrintableChar>yes</nonPrintableChar>
+				
+				<!--## Store all flows into files with 5 minute windows -->
+				<output>
+					<!--## Output type identification -->
+					<type>file</type>
+					
+					<!--## Storage directory for data collected by the plugin -->
+					<path>/tmp/ipfixcol/flow/%Y/%m/%d/</path>
+					<!--## Specifies name prefix for output files. -->
+					<prefix>json.</prefix>
+					
+					<dumpInterval>
+						<!--## Specifies the time interval in seconds to rotate files -->
+						<timeWindow>300</timeWindow>
+						<!--## Align file rotation with next N minute interval -->
+						<timeAlignment>yes</timeAlignment>
+					</dumpInterval>
+				</output>
+			</fileWriter>
+		</destination>
+
+		<singleManager>yes</singleManager>
+	</exportingProcess>
+
+<!-- List of active Intermediate Plugins -->
+	<intermediatePlugins>
+	</intermediatePlugins>
+
+</ipfix>
+
