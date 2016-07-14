@@ -100,7 +100,7 @@ for subvolume_dht in volume_dht['subvolumes']:
     subvolume_replicate_first = volfile_dict[subvolume_dht]['subvolumes'][0]
     #loop trhough all its options and chech if it is local brick
     for key, value in volfile_dict[subvolume_replicate_first]['option']:
-        if key == 'remote-host' and value == socket.gethostname():
+        if key == 'remote-host' and socket.getfqdn(value) == socket.getfqdn():
             local_subvolume_dht = subvolume_dht
 
 if not local_subvolume_dht:
