@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ipfix xmlns="urn:ietf:params:xml:ns:yang:ietf-ipfix-psamp">
+
+	<!--## Collecting TCP process -->
+	<collectingProcess>
+		<!--## Arbitrary collecting process name  -->
+		<name>TCP collector</name>
+		<!--## Type of the collector. Supported types are defined in internalcfg.xml -->
+		<tcpCollector>
+			<!--## Arbitrary TCP collector name -->
+			<name>Listening port 4739</name>
+			<!--## Local listening port -->
+			<localPort>4739</localPort>
+			<!--## Local address to listen on. If empty, bind to all interfaces -->
+			<localIPAddress></localIPAddress>
+		</tcpCollector>
+		<!--## Name of the exporting process. Must match exporting process name -->
+		<exportingProcess>Forward TCP</exportingProcess>
+	</collectingProcess>
+
+	<!--## Exporting process configuration -->
+	<exportingProcess>
+		<!--## Name of the exporting process, must match <exportingProcess> element
+			   in <collectingProcess> -->
+		<name>Forward TCP</name>
+		<!--## Specification of storage plugin -->
+		<destination>
+			<!--## Arbitrary name -->
+			<name>Forward flows to collectors</name>
+
+			<!--## Configuration to storage plugin -->
+			<fileWriter>
+				<!--## Plugin (internal plugin identification) -->
+				<fileFormat>forwarding</fileFormat>
+
+				<!--## Distribution type -->
+				<distribution>RoundRobin</distribution>
+				<!--## Default port number. It can be overriden by port tag in destination. -->
+				<defaultPort>4741</defaultPort>
+
+				<!--## Destination address -->
+				<destination>
+					<ip>192.168.0.1</ip>
+				</destination>
+				<destination>
+					<ip>192.168.0.2</ip>
+				</destination>
+
+			</fileWriter>
+		</destination>
+		<!--## Only one plugin for all ODIDs -->
+		<singleManager>yes</singleManager>
+	</exportingProcess>
+
+	<!-- List of active Intermediate Plugins -->
+	<intermediatePlugins>
+	</intermediatePlugins>
+</ipfix>

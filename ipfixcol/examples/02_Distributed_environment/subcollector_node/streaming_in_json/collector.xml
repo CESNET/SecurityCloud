@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ipfix xmlns="urn:ietf:params:xml:ns:yang:ietf-ipfix-psamp">
+
+	<!--## Collecting TCP process -->
+	<collectingProcess>
+		<!--## Arbitrary collecting process name  -->
+		<name>TCP collector</name>
+		<!--## Type of the collector. Supported types are defined in internalcfg.xml -->
+		<tcpCollector>
+			<!--## Arbitrary TCP collector name -->
+			<name>Listening port 4741</name>
+			<!--## Local listening port -->
+			<localPort>4741</localPort>
+			<!--## Local address to listen on. If empty, bind to all interfaces -->
+			<localIPAddress></localIPAddress>
+		</tcpCollector>
+		<!--## Name of the exporting process. Must match exporting process name -->
+		<exportingProcess>Stream flows</exportingProcess>
+	</collectingProcess>
+
+	<!--## Exporting process configuration -->
+	<exportingProcess>
+		<!--## Name of the exporting process, must match <exportingProcess> element
+			   in <collectingProcess> -->
+		<name>Stream flows</name>
+
+		<!--## Specification of storage plugin -->
+		<destination>
+			<!--## Arbitrary name -->
+			<name>JSON storage</name>
+
+			<!--## Configuration to storage plugin -->
+			<fileWriter>
+				<!--## Plugin (internal plugin identification) -->
+				<fileFormat>json</fileFormat>
+
+				<!--## TCP flags format - formated e.g. ".AP.SF" -->
+				<tcpFlags>formated</tcpFlags>
+				<!--## Timestamp format - formated e.g. "2015-08-03T14:10:20.012" -->
+				<timestamp>formated</timestamp>
+				<!--## Protocol identication format - formated e.g. "TCP" -->
+				<protocol>formated</protocol>
+				<!--## Ignore flow elements with unknown semantics -->
+				<ignoreUnknown>yes</ignoreUnknown>
+
+				<!--## Sends JSON records directly over the network to one destination -->
+				<output>
+					<!--## Output type identification -->
+					<type>send</type>
+					<!--## IPv4/IPv6 address of remote host -->
+					<ip>127.0.0.1</ip>
+					<!--## Remote port number -->
+					<port>4444</port>
+					<!--## Connection protocol -->
+					<protocol>udp</protocol>
+				</output>
+
+				<!--## Creates TCP server and sends data to connected clients -->
+				<output>
+					<!--## Output type identification -->
+					<type>server</type>
+					<!--## Local port number -->
+					<port>4800</port>
+					<!--## Non-blocking connection skips undeliverable flows -->
+					<blocking>no</blocking>
+				</output>
+
+				<!--## Multiple outputs (even of the same type) can be specified -->
+
+			</fileWriter>
+		</destination>
+		<!--## Only one plugin for all ODIDs -->
+		<singleManager>yes</singleManager>
+	</exportingProcess>
+
+	<!-- List of active Intermediate Plugins -->
+	<intermediatePlugins>
+	</intermediatePlugins>
+</ipfix>
