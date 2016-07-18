@@ -21,6 +21,8 @@ print_help() {
         echo -e "Commands:"
         echo -e "\tcheck             check health of the cluster"
         echo -e "\tsetup_gluster     setup GlusterFS file system"
+        echo -e "\tsetup_ipfixcol    setup IPFIXcol framework"
+        echo -e "\tsetup_fdistdump   setup fdistdump query tool"
 }
 
 error() {
@@ -42,11 +44,9 @@ parse_config() {
                         #definition of nodes
                         "node_proxy")
                                 PRO_NODES[${#PRO_NODES[*]}]="${VALUE}"
-                                ALL_NODES[${#ALL_NODES[*]}]="${VALUE}"
                                 ;;
                         "node_subcollector")
                                 SUB_NODES[${#SUB_NODES[*]}]="${VALUE}"
-                                ALL_NODES[${#ALL_NODES[*]}]="${VALUE}"
                                 ;;
 
                         #GlusterFS options
@@ -57,6 +57,8 @@ parse_config() {
                         "gfs_flow_mount") GFS_FLOW_MOUNT="${VALUE}";;
                 esac
         done < <(grep "^[^=]*=" "$1") #process substitution magic
+
+        ALL_NODES=( ${SUB_NODES[*]} ${PRO_NODES[*]} )
 }
 
 ssh_exec() {
@@ -74,17 +76,9 @@ ssh_exec() {
 #health checking functions
 
 check() {
-        echo "################################################################################"
-        echo "CHECK"
-        echo
-
         ssh_exec "${ALL_NODES[*]}" check_network || return $?
         ssh_exec "${ALL_NODES[*]}" check_programs || return $?
         ssh_exec "${ALL_NODES[*]}" check_libraries || return $?
-
-        echo
-        echo "It seems that everyting went OK"
-        echo "################################################################################"
 }
 
 check_network() {
@@ -158,17 +152,9 @@ check_libraries() {
 #setup GlusterFS functions
 
 setup_gluster() {
-        echo "################################################################################"
-        echo "SETING UP GLUSTERFS"
-        echo
-
         ssh_exec "${ALL_NODES[*]}" setup_gluster1_all || return $?
         ssh_exec "${ALL_NODES[0]}" setup_gluster2_one || return $?
         ssh_exec "${ALL_NODES[*]}" setup_gluster3_all || return $?
-
-        echo
-        echo "It seems that everyting went OK"
-        echo "################################################################################"
 }
 
 setup_gluster1_all() {
@@ -198,8 +184,7 @@ setup_gluster1_all() {
         #download and install custom filter
         local GFS_VERSION="$(gluster --version | head -1 | cut -d" " -f 2)" || return $?
         local GFS_PATH="$(find /usr/ -type d -path "/usr/lib*/glusterfs/${GFS_VERSION}")" || return $?
-        mkdir -p "${GFS_PATH}/filter/"
-        wget -O "${GFS_PATH}/filter/filter.py" "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/gluster/filter.py" &> /dev/null || return $?
+        wget -q -N -P "${GFS_PATH}/filter/" "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/gluster/filter.py" || return $?
         chmod +x "${GFS_PATH}/filter/filter.py"
 }
 
@@ -284,10 +269,74 @@ setup_gluster3_all() {
 
 
 ################################################################################
+#setup IPFIXcol functions
+
+setup_ipfixcol() {
+        ssh_exec "${ALL_NODES[*]}" setup_ipfixcol1_all || return $?
+}
+
+setup_ipfixcol1_all() {
+        #download and install OCF resource agent
+        echo "Downloading OCF resource agent"
+        local OCF_PATH="/usr/lib/ocf/resource.d/"
+        wget -q -N -P "${OCF_PATH}/cesnet/" "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/ipfixcol/ocf/ipfixcol."{sh,metadata} || return $?
+        chmod +x "${OCF_PATH}/cesnet/"*
+}
+
+
+################################################################################
+#setup fdistdump functions
+
+setup_fdistdump() {
+        ssh_exec "${ALL_NODES[*]}" setup_fdistdump1_all || return $?
+}
+
+setup_fdistdump1_all() {
+        #download and install HA launcher
+        echo "Downloading HA launcher"
+        local FDD_PATH=$(dirname $(command -v fdistdump))
+        wget -q -N -P "${FDD_PATH}" "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/fdistdump/fdistdump-ha" || return $?
+        chmod +x "${FDD_PATH}/fdistdump-ha"
+}
+
+
+################################################################################
+#setup corosync/pacemaker functions
+
+setup_stack() {
+        ssh_exec "${ALL_NODES[*]}" setup_stack1_all || return $?
+}
+
+setup_stack1_all() {
+        #setup corosync localy for all nodes (we are not using pcsd), start and enable corosync and pacemaker
+        pcs cluster setup --local --name "security_cloud" ${ALL_NODES[*]} --force || return $?
+        pcs cluster start || return $?
+        pcs cluster enable || return $?
+        #verify
+        corosync-cpgtool > /dev/null || return $?
+
+
+        local CNT=${#SUB_NODES[*]}
+        for ((I=0; I<CNT; I++))
+        do
+                #am I amongst subcollectors?
+                if ip addr show | grep -q " ${SUB_NODES[${I}]}/"; then
+                        echo pcs property set set --force --node "$(uname -n)" "SUCCESSOR=$(((I+1)%CNT+1))"
+                fi
+        done
+}
+
+setup_stack2_one() {
+        #disable STONITH
+        pcs property set "stonith-enabled=false" || return $?
+}
+
+
+################################################################################
 #initialization, default argument values
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 CONF_FILE="${DIR}/install.conf"
-PROGRAMS=(libnf-info ipfixcol fdistdump corosync pacemakerd pcs glusterd gluster)
+PROGRAMS=(libnf-info ipfixcol fdistdump corosync pacemakerd pcs glusterd gluster crm_node ip)
 LIBRARIES=(libnf libcpg)
 
 #check argument count
@@ -345,8 +394,10 @@ if [ "${#SUB_NODES[*]}" -lt 1 ]; then
         exit 1
 fi
 
+OUT_PREFIX="<$(hostname)>"
 #replicate this script and the configuration file to all nodes
 if [ -z "${SSH}" ]; then
+        OUT_PREFIX="[${COMMAND%% *}]"
         check_network || exit $?
 
         for NODE in ${ALL_NODES[*]}
@@ -357,4 +408,16 @@ if [ -z "${SSH}" ]; then
 fi
 
 #execute supplied command (it is supposed to be a function)
-${COMMAND}
+${COMMAND} 2>&1 | sed "s/^/${OUT_PREFIX} /"
+RC=${PIPESTATUS[0]} #exit with COMMAND exit status, not sed
+
+if [ -z "${SSH}" ]; then
+        echo
+        if [ $RC -eq 0 ]; then
+                echo "It seems that everyting went OK"
+        else
+                echo "It seems that something went wrong"
+        fi
+fi
+
+exit $RC
