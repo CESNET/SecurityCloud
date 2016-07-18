@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ipfix xmlns="urn:ietf:params:xml:ns:yang:ietf-ipfix-psamp">
+
+	<!--## Every collecting process will be started as new process -->
+	<collectingProcess>
+		<!--## Arbitrary collecting process name  -->
+		<name>UDP-CPG collector</name>
+		<!--## Type of the collector. Supported types are defined in internalcfg.xml -->
+		<udp-cpgCollector>
+			<!--## Arbitrary udp collector name -->
+			<name>Listening port 4739</name>
+
+			<!--## Local listening port -->
+			<localPort>4739</localPort>
+
+			<!--## Template lifetime in seconds -->
+			<templateLifeTime>1800</templateLifeTime>
+			<!--## Options template lifetime in seconds -->
+			<optionsTemplateLifeTime>1800</optionsTemplateLifeTime>
+			<!--## Template lifetime in packets (for how many packets is template valid) -->
+			<!-- <templateLifePacket>5</templateLifePacket>  -->
+			<!--## Options template lifetime in packets -->
+			<!-- <optionsTemplateLifePacket>100</optionsTemplateLifePacket>  -->
+			<!--## Local address to listen on. If empty, bind to all interfaces -->
+			<localIPAddress></localIPAddress>
+
+			<!--## Name of CPG synchronization group -->
+			<CPGName>ipfixcol</CPGName>
+
+		</udp-cpgCollector>
+		<exportingProcess>Forward UDP</exportingProcess>
+	</collectingProcess>
+
+	<!--## Exporting process configuration -->
+	<exportingProcess>
+		<!--## Name of the exporting process, must match <exportingProcess> element
+			   in <collectingProcess> -->
+		<name>Forward UDP</name>
+		<!--## Specification of storage plugin -->
+		<destination>
+			<!--## Arbitrary name -->
+			<name>Forward flows to collectors</name>
+
+			<!--## Configuration to storage plugin -->
+			<fileWriter>
+				<!--## Plugin (internal plugin identification) -->
+				<fileFormat>forwarding</fileFormat>
+
+				<!--## Distribution type -->
+				<distribution>RoundRobin</distribution>
+				<!--## Default port number. It can be overriden by port tag in destination. -->
+				<defaultPort>4741</defaultPort>
+
+				<!--## Destination address -->
+				<destination>
+					<ip>192.168.0.1</ip>
+				</destination>
+				<destination>
+					<ip>192.168.0.2</ip>
+				</destination>
+
+			</fileWriter>
+		</destination>
+		<!--## Only one plugin for all ODIDs -->
+		<singleManager>yes</singleManager>
+	</exportingProcess>
+
+	<!-- List of active Intermediate Plugins -->
+	<intermediatePlugins>
+	</intermediatePlugins>
+</ipfix>

@@ -1,0 +1,97 @@
+<!-- Live profile (default - always must exists) -->
+<profile name="live">
+	<!--## Type of a profile -->
+	<type>normal</type>
+	<!--## Directory for data store of valuable data and statistics -->
+	<directory>/some/directory/</directory>
+
+	<!-- List of channels that belong to the profile -->
+	<channelList>
+		<channel name="ch1">
+			<!--## List of sources from which channel will receive data -->
+			<sourceList>
+				<!--## Live profile always use "*" -->
+				<source>*</source>
+			</sourceList>
+			<!--## Filter applied on records, specifying whether it belongs to the profile -->
+			<filter>ipVersion = 4</filter>
+		</channel>
+		<channel name="ch2">
+			<sourceList>
+				<source>*</source>
+			</sourceList>
+			<filter>ipVersion = 6</filter>
+		</channel>
+	</channelList>
+
+	<!--## List of subprofiles that belong to the live profile -->
+	<subprofileList>
+		<!--## Example subprofile for -->
+		<profile name="emails">
+			<type>normal</type>
+			<directory>/some/directory/p1/</directory>
+
+			<channelList>
+				<!-- POP3 flows -->
+				<channel name="pop3">
+					<sourceList>
+						<!--## Sources are channels only from the parent profile -->
+						<source>ch1</source>
+						<source>ch2</source>
+					</sourceList>
+					<filter>
+						sourceTransportPort == 110 OR
+						destinationTransportPort == 110 OR
+						sourceTransportPort == 995 OR
+						destinationTransportPort == 995
+					</filter>
+				</channel>
+
+				<!-- IMAP flows -->
+				<channel name="imap">
+					<sourceList>
+						<source>ch1</source>
+						<source>ch2</source>
+					</sourceList>
+					<filter>
+						sourceTransportPort == 143 OR
+						destinationTransportPort == 143 OR
+						sourceTransportPort == 993 OR
+						destinationTransportPort == 993
+					</filter>
+				</channel>
+
+				<!-- SMTP flows -->
+				<channel name="smtp">
+					<sourceList>
+						<source>ch1</source>
+						<source>ch2</source>
+					</sourceList>
+					<filter>
+						sourceTransportPort == 25 OR
+						destinationTransportPort == 25 OR
+						sourceTransportPort == 465 OR
+						destinationTransportPort == 465
+					</filter>
+				</channel>
+			</channelList>
+
+			<!--## Subprofiles can also have their own subprofiles -->
+			<!--
+			<subprofileList>
+				...
+			</subprofileList>
+			-->
+
+		</profile>
+
+	<!-- Other subprofiles goes here -->
+	<!--
+		<profile name="http">
+		...
+		</profile>
+	-->
+
+	</subprofileList>
+</profile>
+
