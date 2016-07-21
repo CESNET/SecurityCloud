@@ -80,17 +80,22 @@ ipfixcol_start() {
         #return code of ipfixcol is always 0 because of deamon, but test it anyway :)
         if [ $RC -ne $OCF_SUCCESS ]
         then
-                ocf_log err "${LOG_PREFIX}failed, return code = ${RC}"
+                ERR="IPFIXcol start failed, return code = ${RC}"
+                ocf_log err "${LOG_PREFIX}${ERR}"
+                ocf_exit_reason "${ERR}"
                 return $OCF_ERR_GENERIC
         fi
 
         sleep "${TIMEOUT}" #wait for startup
-        ipfixcol_monitor
-        if [ $? -ne 1 ]
-        then
-                ocf_log err "${LOG_PREFIX}after startup monitor failed"
-                return $OCF_ERR_GENERIC
-        fi
+        #TODO: should we perform after startup monitor?
+        #ipfixcol_monitor
+        #if [ $? -ne 1 ]
+        #then
+        #        ERR="after startup monitor failed"
+        #        ocf_log err "${LOG_PREFIX}${ERR}"
+        #        ocf_exit_reason "${ERR}"
+        #        return $OCF_ERR_GENERIC
+        #fi
 
         return $OCF_SUCCESS
 }
@@ -135,7 +140,9 @@ ipfixcol_stop() {
                 ocf_log warn "${LOG_PREFIX}SIG${SIGNAL} failed to stop all PIDs"
         done
 
-        ocf_log err "${LOG_PREFIX}failed to stop"
+        ERR="failed to stop"
+        ocf_log err "${LOG_PREFIX}${ERR}"
+        ocf_exit_reason "${ERR}"
         return $OCF_ERR_GENERIC
 }
 
@@ -184,7 +191,9 @@ ipfixcol_metadata() {
 
         if [ ! -f "$METADATA_FILE" ]
         then
-                ocf_log err "${LOG_PREFIX}metadata file \"${METADATA_FILE}\" doesn't exist"
+                ERR="metadata file \"${METADATA_FILE}\" doesn't exist"
+                ocf_log err "${LOG_PREFIX}${ERR}"
+                ocf_exit_reason "${ERR}"
                 return $OCF_ERR_GENERIC
         else
                 cat "$METADATA_FILE"
@@ -198,14 +207,18 @@ ipfixcol_validate_shallow() {
         #correct role test
         if [ "$OCF_RESKEY_role" != proxy -a "$OCF_RESKEY_role" != subcollector ]
         then
-                ocf_log err "${LOG_PREFIX}invalid role \"${OCF_RESKEY_role}\""
+                ERR="invalid role \"${OCF_RESKEY_role}\""
+                ocf_log err "${LOG_PREFIX}${ERR}"
+                ocf_exit_reason "${ERR}"
                 return $OCF_ERR_ARGS
         fi
 
         #verbosity integer test
         case $OCF_RESKEY_verbosity in
                 *[!0-9]*)
-                        ocf_log err "${LOG_PREFIX}invalid verbosity value: \"${OCF_RESKEY_verbosity}\""
+                        ERR="invalid verbosity value: \"${OCF_RESKEY_verbosity}\""
+                        ocf_log err "${LOG_PREFIX}${ERR}"
+                        ocf_exit_reason "${ERR}"
                         return $OCF_ERR_ARGS
                         ;;
         esac
@@ -214,23 +227,31 @@ ipfixcol_validate_shallow() {
 }
 
 ipfixcol_validate_deep() {
-        local RC
-
         ocf_log debug "${LOG_PREFIX}ipfixcol_validate_deep()"
 
-        ipfixcol_validate_shallow
-        RC=$?
-        [ $RC -eq $OCF_SUCCESS ] || return $RC
+        ipfixcol_validate_shallow || return $?
+
+        if [ -n "$OCF_RESKEY_startup_conf" -a ! -f "$OCF_RESKEY_startup_conf" ]
+        then #defined but file doesn't exist
+                ERR="startup configuration file doesn't exist: \"${OCF_RESKEY_startup_conf}\""
+                ocf_log err "${LOG_PREFIX}${ERR}"
+                ocf_exit_reason "${ERR}"
+                return $OCF_ERR_ARGS
+        fi
 
         if [ -n "$OCF_RESKEY_internal_conf" -a ! -f "$OCF_RESKEY_internal_conf" ]
         then #defined but file doesn't exist
-                ocf_log err "${LOG_PREFIX}internal conf file doesn't exist: \"${OCF_RESKEY_internal_conf}\""
+                ERR="internal configuration file doesn't exist: \"${OCF_RESKEY_internal_conf}\""
+                ocf_log err "${LOG_PREFIX}${ERR}"
+                ocf_exit_reason "${ERR}"
                 return $OCF_ERR_ARGS
         fi
 
         if [ -n "$OCF_RESKEY_ipfix_elements" -a ! -f "$OCF_RESKEY_ipfix_elements" ]
         then #defined but file doesn't exist
-                ocf_log err "${LOG_PREFIX}IPFIX elements set file doesn't exist: \"${OCF_RESKEY_ipfix_elements}\""
+                ERR="IPFIX elements set file doesn't exist: \"${OCF_RESKEY_ipfix_elements}\""
+                ocf_log err "${LOG_PREFIX}${ERR}"
+                ocf_exit_reason "${ERR}"
                 return $OCF_ERR_ARGS
         fi
 
@@ -240,8 +261,6 @@ ipfixcol_validate_deep() {
 }
 
 ipfixcol_main() {
-        local RC
-
         ocf_log debug "${LOG_PREFIX}ipfixcol_main()"
 
         #no validation on meta-data action
@@ -254,9 +273,7 @@ ipfixcol_main() {
         esac
 
         #shallow validation on stop and monitor
-        ipfixcol_validate_shallow
-        RC=$?
-        [ $RC -eq $OCF_SUCCESS ] || return $RC
+        ipfixcol_validate_shallow || return $?
 
         case "$1" in
                 stop)
@@ -276,9 +293,7 @@ ipfixcol_main() {
         esac
 
         #deep validation on start and validate-all
-        ipfixcol_validate_deep
-        RC=$?
-        [ $RC -eq $OCF_SUCCESS ] || return $RC
+        ipfixcol_validate_deep || return $?
 
         case "$1" in
                 start)
@@ -292,7 +307,9 @@ ipfixcol_main() {
                         ;;
                 *)
                         #anything else is error
-                        ocf_log err "${LOG_PREFIX}unimplemented OCF action"
+                        ERR="unimplemented OCF action"
+                        ocf_log err "${LOG_PREFIX}${ERR}"
+                        ocf_exit_reason "${ERR}"
                         return $OCF_ERR_UNIMPLEMENTED
                         ;;
         esac
@@ -310,7 +327,9 @@ LOG_PREFIX="${1} ${OCF_RESKEY_role}: "
 #argument check
 if [ $# -ne 1 ]
 then
-        ocf_log err "${LOG_PREFIX}bad number of arguments ($#): $*"
+        ERR="bad number of arguments ($#): $*"
+        ocf_log err "${LOG_PREFIX}${ERR}"
+        ocf_exit_reason "${ERR}"
         exit $OCF_ERR_ARGS
 else
         ocf_log debug "${LOG_PREFIX}here we go!"
