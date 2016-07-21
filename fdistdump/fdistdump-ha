@@ -195,9 +195,12 @@ def load_setup_dict():
 
     setup_dict = {}
 
-    setup_dict['primary_brick_path'] = get_cluster_attribute('primary_brick_path')
-    setup_dict['secondary_brick_path'] = get_cluster_attribute('secondary_brick_path')
-    setup_dict['gluster_mount_path'] = get_cluster_attribute('gluster_mount_path')
+    for attribute in ['flow-primary-brick', 'flow-backup-brick']:
+        value = get_cluster_attribute(attribute)
+        if value is None:
+            raise Exception('cluster attribute "{}" is not defined'.format(attribute))
+        else:
+            setup_dict[attribute] = value
 
     return setup_dict
 
@@ -331,7 +334,7 @@ def construct_hosts_and_paths(nodes_dict, setup_dict):
             warn_msg = 'Node {} ({}) isn\'t online, '.format(sub, sub_name)
             if succ in online_set: #is successor online?
                 paths.append(os.path.join('%{}:'.format(slave_names.index(succ_name) + 1) + \
-                                setup_dict['secondary_brick_path'], sub_name))
+                                setup_dict['flow-backup-brick'], sub_name))
                 warn_msg += 'using successor {} ({}) as a backup.'.format(succ, succ_name)
                 warnings.warn(warn_msg)
             else: #successor is offline, data set will be incomplete
@@ -340,7 +343,7 @@ def construct_hosts_and_paths(nodes_dict, setup_dict):
                 warnings.warn(warn_msg)
 
     slave_names.insert(0, master_name) #prepend master node to slaves
-    paths.append(os.path.join(setup_dict['primary_brick_path'], '%h'))#append global primary path
+    paths.append(os.path.join(setup_dict['flow-primary-brick'], '%h'))#append global primary path
 
     return (slave_names, paths)
 
