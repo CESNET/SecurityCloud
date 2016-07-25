@@ -131,13 +131,13 @@ ssh_exec() {
                 exit 1
         fi
 
-        local NODES=$1 CONF_NAME="$(basename "${CONF_FILE}")"
+        local NODES=$1 BINARY="$(basename "$0")" CONF_NAME="$(basename "${CONF_FILE}")"
         shift
 
         for NODE in ${NODES}
         do
                 echo "Connecting to ${NODE}."
-                ssh -t "${NODE}" "/tmp/${0}" $* -c "/tmp/${CONF_NAME}" -s || return $?
+                ssh -t "${NODE}" "/tmp/${BINARY}" $* -c "/tmp/${CONF_NAME}" -s || return $?
                 echo
         done
 }
@@ -255,9 +255,11 @@ gluster1_all() {
         fi
 
         #download and install custom filter
+        echo "Downloading custom GlusterFS filter"
         local GFS_VERSION="$(gluster --version | head -1 | cut -d" " -f 2)" || return $?
         local GFS_PATH="$(find /usr/ -type d -path "/usr/lib*/glusterfs/${GFS_VERSION}")" || return $?
-        wget -q -N -P "${GFS_PATH}/filter/" "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/gluster/filter.py" || return $?
+        mkdir -p "${GFS_PATH}/filter/"
+        wget -q -O "${GFS_PATH}/filter/filter.py" "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/gluster/filter.py" || return $?
         chmod +x "${GFS_PATH}/filter/filter.py"
 }
 
@@ -355,8 +357,10 @@ ipfixcol1_all() {
         #download and install OCF resource agent
         echo "Downloading OCF resource agent"
         local OCF_PATH="/usr/lib/ocf/resource.d/"
-        wget -q -N -P "${OCF_PATH}/cesnet/" "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/ipfixcol/ocf/ipfixcol."{sh,metadata} || return $?
-        chmod +x "${OCF_PATH}/cesnet/"*
+        mkdir -p "${OCF_PATH}/cesnet/"
+        wget -q -O "${OCF_PATH}/cesnet/ipfixcol.sh" "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/ipfixcol/ocf/ipfixcol.sh" || return $?
+        wget -q -O "${OCF_PATH}/cesnet/ipfixcol.meta" "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/ipfixcol/ocf/ipfixcol.meta" || return $?
+        chmod +x "${OCF_PATH}/cesnet/ipfixcol.sh"
 }
 
 
@@ -368,11 +372,13 @@ fdistdump() {
 }
 
 fdistdump1_all() {
+        local PATHNAME="$(type -fp fdistdump)"
+        local DIRNAME="$(dirname "${PATHNAME}")"
+
         #download and install HA launcher
         echo "Downloading HA launcher"
-        local FDD_PATH=$(dirname $(command -v fdistdump))
-        wget -q -N -P "${FDD_PATH}" "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/fdistdump/fdistdump-ha" || return $?
-        chmod +x "${FDD_PATH}/fdistdump-ha"
+        wget -q -O "${DIRNAME}/fdistdump-ha" "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/fdistdump/fdistdump-ha" || return $?
+        chmod +x "${DIRNAME}/fdistdump-ha"
 }
 
 
