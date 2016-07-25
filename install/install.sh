@@ -23,7 +23,7 @@ print_help() {
         echo
         echo -e "Commands:"
         echo -e "\tcheck             check health of the cluster"
-        echo -e "\tgluster           setup GlusterFS file system"
+        echo -e "\tglusterfs         setup GlusterFS file system"
         echo -e "\tipfixcol          setup IPFIXcol framework"
         echo -e "\tfdistdump         setup fdistdump query tool"
         echo -e "\tstack             setup Corosync and Pacemaker stack"
@@ -48,8 +48,9 @@ parse_config() {
 
         while read -r KEY VALUE
         do
-                #strip whitespaces around the KEY
+                #strip whitespaces around the KEY and VALUE
                 KEY="$(echo "${KEY}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+                VALUE="$(echo "${VALUE}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
 
                 case "${KEY}" in
                         #definition of nodes
@@ -90,7 +91,12 @@ check_config() {
 }
 
 ssh_exec() {
-        local NODES=$1 CONF_NAME=$(basename "${CONF_FILE}")
+        if [ -n "${SSH}" ]; then
+                error "recursive SSH exec"
+                exit 1
+        fi
+
+        local NODES=$1 CONF_NAME="$(basename "${CONF_FILE}")"
         shift
 
         for NODE in ${NODES}
@@ -117,29 +123,31 @@ check_network() {
         for NODE in ${ALL_NODES[*]}
         do
                 #test getnet ahosts
+                #TODO: solve problem with node name resolved into localhost IP
                 OUT="$(getent ahosts "${NODE}" 2>&1)"
                 RC=$?
-                if [ $RC -ne 0 ]
-                then
-                        error "getent test" "getent ahosts ${NODE}" "${OUT}" $RC
+                if [ $RC -ne 0 ]; then
+                        error "unable to resolve \"${NODE}\"" "getent ahosts ${NODE}" "${OUT}" $RC
                         return $RC
+                fi
+                if echo "${OUT}" | grep "^\(127\.[[:digit:]]\+\.[[:digit:]]\+\.[[:digit:]]\+[[:space:]]\)\|\(::1[[:space:]]\)" &> /dev/null; then
+                        error "${NODE} is mapped to localhost IP address" "getent ahosts ${NODE}"
+                        return 1
                 fi
 
                 #test ping
                 OUT="$(ping -c 1 "${NODE}" 2>&1)"
                 RC=$?
-                if [ $RC -ne 0 ]
-                then
-                        error "ping test" "ping -c 1 ${NODE}" "${OUT}" $RC
+                if [ $RC -ne 0 ]; then
+                        error "unable to ping ${NODE}" "ping -c 1 ${NODE}" "${OUT}" $RC
                         return $RC
                 fi
 
                 #test SSH
                 OUT="$(ssh "${NODE}" true 2>&1)"
                 RC=$?
-                if [ $RC -ne 0 ]
-                then
-                        error "SSH test (not working SSH to ${NODE})" "ssh ${NODE} true" "${OUT}" $RC
+                if [ $RC -ne 0 ]; then
+                        error "unable to SSH to ${NODE}" "ssh ${NODE} true" "${OUT}" $RC
                         return $RC
                 fi
         done
@@ -155,7 +163,7 @@ check_programs() {
                 RC=$?
                 if [ $RC -ne 0 ]
                 then
-                        error "program test (\"${PROG}\" is not installed)" "command -v ${PROG}" "${OUT}" $RC
+                        error "program \"${PROG}\" is not installed" "command -v ${PROG}" "${OUT}" $RC
                         return $RC
                 fi
         done
@@ -171,7 +179,7 @@ check_libraries() {
                 RC=$?
                 if [ $RC -ne 0 ]
                 then
-                        error "library test (\"${LIB}\" is not installed)" "ldconfig -p | grep \"${LIB}\.\"" "${OUT}" $RC
+                        error "library \"${LIB}\" is not installed" "ldconfig -p | grep \"${LIB}\.\"" "${OUT}" $RC
                         return $RC
                 fi
         done
@@ -181,7 +189,7 @@ check_libraries() {
 ################################################################################
 #setup GlusterFS functions
 
-gluster() {
+glusterfs() {
         ssh_exec "${ALL_NODES[*]}" gluster1_all || return $?
         ssh_exec "${ALL_NODES[0]}" gluster2_one || return $?
         ssh_exec "${ALL_NODES[*]}" gluster3_all || return $?
@@ -229,7 +237,6 @@ gluster2_one() {
                 sleep 1 #GlusterFS is weired and this helps (sometimes)
         done
 
-
         #create configuration volume "conf"
         if gluster volume info conf &> /dev/null; then
                 echo "volume conf already exists"
@@ -250,7 +257,6 @@ gluster2_one() {
                 echo "starting volume conf"
                 gluster volume start conf || return $?
         fi
-
 
         #create bricks specification for data volume "flow" (ring topology)
         local CNT=${#SUB_NODES[*]}
@@ -344,13 +350,13 @@ stack() {
 }
 
 stack1_all() {
-        ##setup corosync localy for all nodes (we are not using pcsd), start and enable corosync and pacemaker
-        #pcs cluster setup --local --name "security_cloud" ${ALL_NODES[*]} --force || return $?
-        #pcs cluster start || return $?
-        #pcs cluster enable || return $?
-        ##verify
-        #corosync-cpgtool > /dev/null || return $?
-
+        #setup corosync localy for all nodes (we are not using pcsd), start and enable corosync and pacemaker
+        pcs cluster setup --local --name "security_cloud" ${ALL_NODES[*]} --force || return $?
+        pcs cluster start || return $?
+        pcs cluster enable || return $?
+        #verify
+        corosync-cpgtool > /dev/null || return $?
+        sleep 5 #Pacemaker needs some rest before it is ready for action
 
         #clear SUCCESSOR node property everywhere
         pcs property set --force --node "$(uname -n)" "successor=" || return $?
@@ -358,13 +364,16 @@ stack1_all() {
         local CNT=${#SUB_NODES[*]}
         for ((I=0; I<CNT; I++))
         do
-                #am I amongst subcollectors?
-                if ip addr show | grep -q " ${SUB_NODES[${I}]}/"; then
-                        echo "setting property \"successor\""
-                        pcs property set --node "$(uname -n)" "successor=$(((I+1)%CNT+1))" || return $?
-                fi
+                for FQDN in $(hostname -A)
+                do
+                        #am I amongst subcollectors?
+                        if [ "${SUB_NODES[$I],,}" = "${FQDN,,}" ]; then
+                                PROP="successor=$(((I+1)%CNT+1))"
+                                echo "property \"${PROP%%=*}\": setting to \"${PROP#*=}\""
+                                pcs property set --node "$(uname -n)" "${PROP}" || return $?
+                        fi
+                done
         done
-
 }
 
 stack2_one() {
@@ -425,14 +434,14 @@ stack2_one() {
         #create and clone resource for IPFIXcol in role subcollector
         pcs_resource_create "ipfixcol-subcollector" "ocf:cesnet:ipfixcol.sh" \
                         "role=subcollector" "startup_conf=${GFS_CONF_MOUNT}/ipfixcol/startup-subcollector.xml" \
-                        op monitor "interval=20" \
-                        meta "migration-threshold=1" "failure-timeout=600" || return $?
+                        op monitor "interval=20" || return $?
         pcs_resource_clone "ipfixcol-subcollector" "interleave=true" || return $?
 
         #create a resource for virtual IP address
         pcs_resource_create "virtual-ip" "ocf:heartbeat:IPaddr2" \
                         "ip=${VIRTUAL_IP}" \
-                        op monitor "interval=20" || return $?
+                        op monitor "interval=20" \
+                        meta "resource-stickiness=1" || return $?
 
 
         ################################################################################
@@ -550,14 +559,14 @@ pcs_constraint_colocation() {
 ################################################################################
 #Bash version check
 if [ ${BASH_VERSINFO[0]} -lt 4 ]; then
-        error "you need at least Bash 4.0 to run this script" >&2
+        error "you need at least Bash 4.0 to run this script"
         exit 1
 fi
 
 #initialization, default argument values
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 CONF_FILE="${DIR}/install.conf"
-PROGRAMS=(libnf-info ipfixcol fdistdump corosync pacemakerd pcs glusterd gluster crm_node ip)
+PROGRAMS=(libnf-info ipfixcol fdistdump corosync pacemakerd pcs glusterd gluster ip hostname uname)
 LIBRARIES=(libnf libcpg)
 
 #check argument count
@@ -598,7 +607,7 @@ done
 
 #check configuration file existence
 if [ ! -f "${CONF_FILE}" ]; then
-        echo "Error: cannot open configuration file \"${CONF_FILE}\""
+        error "cannot open configuration file \"${CONF_FILE}\""
         exit 1
 fi
 
@@ -606,7 +615,7 @@ fi
 parse_config "${CONF_FILE}"
 check_config || exit $RC
 
-OUT_PREFIX="<$(hostname)>"
+OUT_PREFIX="<$(uname -n)>"
 #replicate this script and the configuration file to all nodes
 if [ -z "${SSH}" ]; then
         OUT_PREFIX="[${COMMAND%% *}]"
@@ -619,7 +628,7 @@ if [ -z "${SSH}" ]; then
         wait
 fi
 
-#execute supplied command (it is supposed to be a function)
+#execute supplied command (it is supposed to be a function defined in this script)
 ${COMMAND} 2>&1 | sed "s/^/${OUT_PREFIX} /"
 RC=${PIPESTATUS[0]} #exit with COMMAND exit status, not sed
 
