@@ -2,7 +2,7 @@
 
 #author: Jan Wrona, wrona@cesnet.cz
 
-# Copyright (C) 2015 CESNET
+# Copyright (C) 2016 CESNET
 #
 # LICENSE TERMS
 #
