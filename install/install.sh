@@ -137,7 +137,7 @@ ssh_exec() {
         for NODE in ${NODES}
         do
                 echo "Connecting to ${NODE}."
-                ssh -t "${NODE}" "/tmp/${BINARY}" $* -c "/tmp/${CONF_NAME}" -s || return $?
+                ssh -o "StrictHostKeyChecking no" -t "${NODE}" "/tmp/${BINARY}" $* -c "/tmp/${CONF_NAME}" -s || return $?
                 echo
         done
 }
@@ -179,10 +179,10 @@ check_network() {
                 fi
 
                 #test SSH
-                OUT="$(ssh "${NODE}" true 2>&1)"
+                OUT="$(ssh -o "StrictHostKeyChecking no" "${NODE}" true 2>&1)"
                 RC=$?
                 if [ $RC -ne 0 ]; then
-                        error "unable to SSH to ${NODE}" "ssh ${NODE} true" "${OUT}" $RC
+                        error "unable to SSH to ${NODE}" "ssh -o \"StrictHostKeyChecking no\" ${NODE} true" "${OUT}" $RC
                         return $RC
                 fi
         done
@@ -259,7 +259,7 @@ gluster1_all() {
         local GFS_VERSION="$(gluster --version | head -1 | cut -d" " -f 2)" || return $?
         local GFS_PATH="$(find /usr/ -type d -path "/usr/lib*/glusterfs/${GFS_VERSION}")" || return $?
         mkdir -p "${GFS_PATH}/filter/"
-        wget -q -O "${GFS_PATH}/filter/filter.py" "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/gluster/filter.py" || return $?
+        wget -nv -O "${GFS_PATH}/filter/filter.py" "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/gluster/filter.py" || return $?
         chmod +x "${GFS_PATH}/filter/filter.py"
 }
 
@@ -354,12 +354,13 @@ ipfixcol() {
 }
 
 ipfixcol1_all() {
+        local OCF_PATH="/usr/lib/ocf/resource.d/"
+
         #download and install OCF resource agent
         echo "Downloading OCF resource agent"
-        local OCF_PATH="/usr/lib/ocf/resource.d/"
         mkdir -p "${OCF_PATH}/cesnet/"
-        wget -q -O "${OCF_PATH}/cesnet/ipfixcol.sh" "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/ipfixcol/ocf/ipfixcol.sh" || return $?
-        wget -q -O "${OCF_PATH}/cesnet/ipfixcol.meta" "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/ipfixcol/ocf/ipfixcol.meta" || return $?
+        wget -nv -O "${OCF_PATH}/cesnet/ipfixcol.sh" "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/ipfixcol/ocf/ipfixcol.sh" || return $?
+        wget -nv -O "${OCF_PATH}/cesnet/ipfixcol.metadata" "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/ipfixcol/ocf/ipfixcol.metadata" || return $?
         chmod +x "${OCF_PATH}/cesnet/ipfixcol.sh"
 }
 
@@ -377,7 +378,7 @@ fdistdump1_all() {
 
         #download and install HA launcher
         echo "Downloading HA launcher"
-        wget -q -O "${DIRNAME}/fdistdump-ha" "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/fdistdump/fdistdump-ha" || return $?
+        wget -nv -O "${DIRNAME}/fdistdump-ha" "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/fdistdump/fdistdump-ha" || return $?
         chmod +x "${DIRNAME}/fdistdump-ha"
 }
 
@@ -391,17 +392,32 @@ stack() {
 }
 
 stack1_all() {
+        #pcs is made for RHEL and requires "/var/log/cluster/" for Corosync logfiles, but debian uses "/var/log/corosync/"
+        local RHEL_LOGDIR="/var/log/cluster/" DEB_LOGDIR="/var/log/corosync/"
+        if [ ! -e "${RHEL_LOGDIR}" ]; then
+                if [ -e "${DEB_LOGDIR}" -a -d "${DEB_LOGDIR}" ]; then
+                        ln -s "${DEB_LOGDIR}" "${RHEL_LOGDIR%/}"
+                else
+                        error "missing log directory (${RHEL_LOGDIR} or ${DEB_LOGDIR})"
+                        exit 1
+                fi
+        fi
+
         #setup corosync localy for all nodes (we are not using pcsd), start and enable corosync and pacemaker
         pcs cluster setup --local --name "security_cloud" ${ALL_NODES[*]} --force || return $?
         pcs cluster start || return $?
-        pcs cluster enable || return $?
+        #pcs cluster enable || return $? #doesn't work on debian
+        systemctl enable corosync.service || return $?
+        #as a precaution we want to prevent pacemaker from starting immediately on our nodes
+        #systemctl enable pacemaker.service || return $?
+
         #verify
         corosync-cpgtool > /dev/null || return $?
         sleep 5 #Pacemaker needs some rest before it is ready for action
 
-        #clear SUCCESSOR node property everywhere
-        pcs property set --force --node "$(uname -n)" "successor=" || return $?
-        #set SUCCESSOR node propery appropriately
+        #delete "successor" node property (attribute) everywhere
+        crm_attribute --node="$(uname -n)" --name="successor" --delete || return $?
+        #set "successor" node propery (attribute) appropriately
         local CNT=${#SUB_NODES[*]}
         for ((I=0; I<CNT; I++))
         do
@@ -411,7 +427,7 @@ stack1_all() {
                         if [ "${SUB_NODES[$I],,}" = "${FQDN,,}" ]; then
                                 PROP="successor=$(((I+1)%CNT+1))"
                                 echo "property \"${PROP%%=*}\": setting to \"${PROP#*=}\""
-                                pcs property set --node "$(uname -n)" "${PROP}" || return $?
+                                crm_attribute --node="$(uname -n)" --name="successor" --update="${PROP#*=}" || return $?
                         fi
                 done
         done
@@ -419,30 +435,20 @@ stack1_all() {
 
 stack2_one() {
         ################################################################################
-        #properties
+        #properties (attributes)
         ################################################################################
         #stonith-enabled: Should failed nodes and nodes with resources that can’t be stopped be shot?)
-        #start-failure-is-fatal: Should a failure to start a resource on a particular node prevent further start attempts on that node?
-        local PROPERTIES_STANDARD=(
-                "stonith-enabled=false"
-                )
         #flow-primary-brick: store info about GlusterFS for fdistdump-ha
         #flow-backup-brick: store info about GlusterFS for fdistdump-ha
-        local PROPERTIES_PROPRIETARY=(
+        local PROPERTIES=(
+                "stonith-enabled=false"
                 "flow-primary-brick=${GFS_FLOW_PRIMARY_BRICK}"
                 "flow-backup-brick=${GFS_FLOW_BACKUP_BRICK}"
                 )
-        #set standard properties
-        for PROP in ${PROPERTIES_STANDARD[*]}
+        for PROP in ${PROPERTIES[*]}
         do
                 echo "property \"${PROP%%=*}\": setting to \"${PROP#*=}\""
-                pcs property set "${PROP}" || return $?
-        done
-        #set proprietary properties
-        for PROP in ${PROPERTIES_PROPRIETARY[*]}
-        do
-                echo "property \"${PROP%%=*}\": setting to \"${PROP#*=}\""
-                pcs property set --force "${PROP}" || return $?
+                crm_attribute  --name="${PROP%%=*}" --update="${PROP#*=}" || return $?
         done
 
 
@@ -607,7 +613,7 @@ fi
 #initialization, default argument values
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 CONF_FILE="${DIR}/install.conf"
-PROGRAMS=(libnf-info ipfixcol fdistdump corosync pacemakerd pcs glusterd gluster ip hostname uname)
+PROGRAMS=(libnf-info ipfixcol fdistdump corosync pacemakerd pcs glusterd gluster ip hostname uname crm_attribute)
 LIBRARIES=(libnf libcpg)
 
 #check argument count
@@ -664,7 +670,7 @@ if [ -z "${SSH}" ]; then
 
         for NODE in ${ALL_NODES[*]}
         do
-                scp "${0}" "${CONF_FILE}" "${NODE}:/tmp/" &> /dev/null &
+                scp -o "StrictHostKeyChecking no" "${0}" "${CONF_FILE}" "${NODE}:/tmp/" &> /dev/null &
         done
         wait
 fi
