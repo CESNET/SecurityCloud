@@ -773,9 +773,9 @@ RC=${PIPESTATUS[0]} #exit with COMMAND exit status, not sed
 
 if [ -z "${SSH}" ]; then
         if [ $RC -eq 0 ]; then
-                echo "It seems that everyting went OK :-)"
+                echo "It seems that everyting went OK!"
         else
-                echo "It seems that something went wrong :-("
+                echo "It seems that something went wrong!"
                 echo "You can try to run the script again."
         fi
 fi
