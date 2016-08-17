@@ -21,7 +21,7 @@
                         <content type="string" />
                 </parameter>
 
-                <parameter name="startup_conf" unique="1" required="0">
+                <parameter name="startup_conf" unique="0" required="0">
                         <longdesc lang="en">
                                 Read startup configuration from this file.
                         </longdesc>
@@ -29,7 +29,7 @@
                         <content type="string" default="" />
                 </parameter>
 
-                <parameter name="internal_conf" unique="1" required="0">
+                <parameter name="internal_conf" unique="0" required="0">
                         <longdesc lang="en">
                                 Read internal configuration from this file.
                         </longdesc>
@@ -37,7 +37,7 @@
                         <content type="string" default="" />
                 </parameter>
 
-                <parameter name="ipfix_elements" unique="1" required="0">
+                <parameter name="ipfix_elements" unique="0" required="0">
                         <longdesc lang="en">
                                 Read set of IPFIX elements from this file.
                         </longdesc>
@@ -45,9 +45,9 @@
                         <content type="string" default="" />
                 </parameter>
 
-                <parameter name="verbosity" unique="1" required="0">
+                <parameter name="verbosity" unique="0" required="0">
                         <longdesc lang="en">
-                                Set ipfixcol verbosity level to level.
+                                Set ipfixcol verbosity level.
                                 The higher the number, the more information is printed.
                                 Level 0 shows only errors, level 1 shows warnings,
                                 level 2 shows notices, level 3 shows debug messages.
@@ -56,12 +56,30 @@
                         <content type="integer" default="0" />
                 </parameter>
 
-                <parameter name="additional_args" unique="1" required="0">
+                <parameter name="additional_args" unique="0" required="0">
                         <longdesc lang="en">
                                 Any valid additional IPFIXcol arguments.
                         </longdesc>
                         <shortdesc lang="en">Additional arguments.</shortdesc>
                         <content type="string" default="0" />
+                </parameter>
+
+                <parameter name="user" unique="0" required="0">
+                        <longdesc lang="en">
+                                The system user the IPFIXcol processes will run as.
+                                Value can be a user name or numeric user ID.
+                        </longdesc>
+                        <shortdesc lang="en">IPIFXcol user.</shortdesc>
+                        <content type="string" default="hacluster" />
+                </parameter>
+
+                <parameter name="group" unique="0" required="0">
+                        <longdesc lang="en">
+                                The system group the IPFIXcol processes will run as.
+                                Value can be a group name or numeric group ID.
+                        </longdesc>
+                        <shortdesc lang="en">IPIFXcol user.</shortdesc>
+                        <content type="string" default="user's effective group ID" />
                 </parameter>
         </parameters>
 

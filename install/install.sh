@@ -202,6 +202,18 @@ check_programs() {
                         return $RC
                 fi
         done
+
+        #user existence test
+        if ! getent passwd "${USER}" >/dev/null; then
+                error "user \"${USER}\" doesn't exist" "getent passwd ${USER}"
+                return 1
+        fi
+
+        #group existence test
+        if ! getent group "${GROUP}" >/dev/null; then
+                erro "group \"${GROUP}\" doesn't exist" "getent group ${GROUP}"
+                return 1
+        fi
 }
 
 check_libraries() {
@@ -332,6 +344,8 @@ gluster3_all() {
                 echo "mounting volume conf"
                 mount -t glusterfs localhost:/conf "${GFS_CONF_MOUNT}"
         fi
+        #change owner so IPFIXcol running under $USER can write there
+        chown "${USER}":"${GROUP}" "${GFS_CONF_MOUNT}"
 
         #mount data volume "flow"
         if mountpoint -q "${GFS_FLOW_MOUNT}"; then
@@ -340,6 +354,8 @@ gluster3_all() {
                 echo "mounting volume flow"
                 mount -t glusterfs localhost:/flow "${GFS_FLOW_MOUNT}"
         fi
+        #change owner so IPFIXcol running under $USER can write there
+        chown "${USER}":"${GROUP}" "${GFS_FLOW_MOUNT}"
 }
 
 
@@ -565,14 +581,14 @@ stack2_one() {
 
         #create and clone resource for IPFIXcol in role proxy
         pcs_resource_create "ipfixcol-proxy" "ocf:cesnet:ipfixcol.sh" \
-                        "role=proxy" "startup_conf=${GFS_CONF_MOUNT}/ipfixcol/startup-proxy.xml" \
+                        "role=proxy" "startup_conf=${GFS_CONF_MOUNT}/ipfixcol/startup-proxy.xml" "verbosity=1" \
                         op monitor "interval=20" \
                         meta "migration-threshold=1" "failure-timeout=600" || return $?
         pcs_resource_clone "ipfixcol-proxy" "clone-max=2" "interleave=true" || return $?
 
         #create and clone resource for IPFIXcol in role subcollector
         pcs_resource_create "ipfixcol-subcollector" "ocf:cesnet:ipfixcol.sh" \
-                        "role=subcollector" "startup_conf=${GFS_CONF_MOUNT}/ipfixcol/startup-subcollector.xml" \
+                        "role=subcollector" "startup_conf=${GFS_CONF_MOUNT}/ipfixcol/startup-subcollector.xml" "verbosity=1" \
                         op monitor "interval=20" || return $?
         pcs_resource_clone "ipfixcol-subcollector" "interleave=true" || return $?
 
@@ -705,8 +721,10 @@ fi
 #initialization, default argument values
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 CONF_FILE="${DIR}/install.conf"
-PROGRAMS=(libnf-info ipfixcol fdistdump corosync pacemakerd pcs glusterd gluster ip hostname uname crm_attribute xmllint)
+PROGRAMS=(libnf-info ipfixcol fdistdump corosync pacemakerd pcs glusterd gluster ip hostname uname crm_attribute xmllint chown)
 LIBRARIES=(libnf libcpg)
+USER="hacluster"
+GROUP="$(id -gn "${USER}")"
 
 #check argument count
 if [ $# -lt 1 ]; then

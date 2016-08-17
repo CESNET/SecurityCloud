@@ -45,12 +45,14 @@
 #       OCF_RESKEY_ipfix_elements
 #       OCF_RESKEY_verbosity
 #       OCF_RESKEY_additional_args
+#       OCF_RESKEY_user
+#       OCF_RESKEY_group
 #######################################################################
 
 
 ipfixcol_start() {
         local ARGS="-d" #always deamonize
-        local PIDFILE="${HA_VARRUN}ipfixcol-${OCF_RESKEY_role}.pid"
+        local PIDFILE="${HA_VARRUN}/ipfixcol/${OCF_RESKEY_role}.pid"
         local TIMEOUT=2 #start timeout
         local RC
 
@@ -74,13 +76,20 @@ ipfixcol_start() {
                 return $OCF_SUCCESS
         fi
 
-        ocf_log info "${LOG_PREFIX}starting ${IPFIXCOL_BIN} ${ARGS}"
-        ocf_run eval ${IPFIXCOL_BIN} ${ARGS}
+        #non root users cannon write directly to /var/run/
+        ocf_log debug "${LOG_PREFIX}creating PIDfile directory " \
+                "$(dirname "${PIDFILE}") as a ${OCF_RESKEY_user}":"${OCF_RESKEY_group}"
+        mkdir -p "$(dirname "${PIDFILE}")"
+        chown "${OCF_RESKEY_user}":"${OCF_RESKEY_group}" "$(dirname "${PIDFILE}")"
+
+        #start ipfixcol
+        ocf_log info "${LOG_PREFIX}starting ${IPFIXCOL_BIN} ${ARGS} as user ${OCF_RESKEY_user}"
+        OUT=$(su -s /usr/bin/sh -c "${IPFIXCOL_BIN} ${ARGS}" "${OCF_RESKEY_user}" 2>&1)
         RC=$?
         #return code of ipfixcol is always 0 because of deamon, but test it anyway :)
-        if [ $RC -ne $OCF_SUCCESS ]
+        if [ $RC -ne 0 ]
         then
-                ERR="IPFIXcol start failed, return code = ${RC}"
+                ERR="IPFIXcol start failed, RC = ${RC}, OUT = ${OUT}"
                 ocf_log err "${LOG_PREFIX}${ERR}"
                 ocf_exit_reason "${ERR}"
                 return $OCF_ERR_GENERIC
@@ -101,7 +110,7 @@ ipfixcol_start() {
 }
 
 ipfixcol_stop() {
-        local PIDFILE="${HA_VARRUN}ipfixcol-${OCF_RESKEY_role}.pid"
+        local PIDFILE="${HA_VARRUN}/ipfixcol/${OCF_RESKEY_role}.pid"
         local PIDLIST
         local TIMEOUT=5 #stop timeout
         local WAITING=0
@@ -147,7 +156,7 @@ ipfixcol_stop() {
 }
 
 ipfixcol_monitor() {
-        local PIDFILE="${HA_VARRUN}ipfixcol-${OCF_RESKEY_role}.pid"
+        local PIDFILE="${HA_VARRUN}/ipfixcol/${OCF_RESKEY_role}.pid"
         local PROC_PIDFILE_CNT #number of PIDs in pidfile
         local PROC_RUNNING_CNT=0 #number of running processes
 
@@ -222,6 +231,22 @@ ipfixcol_validate_shallow() {
                         return $OCF_ERR_ARGS
                         ;;
         esac
+
+        #user existence test
+        if ! getent passwd "${OCF_RESKEY_user}" >/dev/null; then
+                ERR="user \"${OCF_RESKEY_user}\" doesn't exist"
+                ocf_log err "${LOG_PREFIX}${ERR}"
+                ocf_exit_reason "${ERR}"
+                return $OCF_ERR_ARGS
+        fi
+
+        #group existence test
+        if ! getent group "${OCF_RESKEY_group}" >/dev/null; then
+                ERR="group \"${OCF_RESKEY_group}\" doesn't exist"
+                ocf_log err "${LOG_PREFIX}${ERR}"
+                ocf_exit_reason "${ERR}"
+                return $OCF_ERR_ARGS
+        fi
 
         return $OCF_SUCCESS
 }
@@ -320,6 +345,12 @@ ipfixcol_main() {
 #initialization
 : ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
 . ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+
+#use supplied values or default values
+OCF_RESKEY_user_default="hacluster"
+: "${OCF_RESKEY_user="${OCF_RESKEY_user_default}"}"
+: "${OCF_RESKEY_group="$(id -gn "${OCF_RESKEY_user}")"}"
+
 
 IPFIXCOL_BIN=ipfixcol
 LOG_PREFIX="${1} ${OCF_RESKEY_role}: "
