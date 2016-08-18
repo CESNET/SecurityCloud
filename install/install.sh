@@ -211,7 +211,7 @@ check_programs() {
 
         #group existence test
         if ! getent group "${GROUP}" >/dev/null; then
-                erro "group \"${GROUP}\" doesn't exist" "getent group ${GROUP}"
+                error "group \"${GROUP}\" doesn't exist" "getent group ${GROUP}"
                 return 1
         fi
 }
@@ -282,8 +282,16 @@ gluster2_one() {
         for NODE in ${ALL_NODES[*]}
         do
                 gluster peer probe "${NODE}" || return $?
+                sleep 1
+
+                #wait for desired peer state
+                while gluster peer status | grep -i "state:" | grep -iv "peer in cluster" &>/dev/null
+                do
+                        echo "waiting for \"${NODE}\" to get into the \"Peer in Cluster\" state"
+                        sleep 1
+                done
+
                 CONF_BRICKS="${CONF_BRICKS}${NODE}:${GFS_CONF_BRICK} "
-                sleep 1 #GlusterFS is weired and this helps (sometimes)
         done
 
         #create configuration volume "conf"
@@ -342,7 +350,7 @@ gluster3_all() {
                 echo "volume conf already mounted"
         else
                 echo "mounting volume conf"
-                mount -t glusterfs localhost:/conf "${GFS_CONF_MOUNT}"
+                mount -t glusterfs localhost:/conf "${GFS_CONF_MOUNT}" || return $?
         fi
         #change owner so IPFIXcol running under $USER can write there
         chown "${USER}":"${GROUP}" "${GFS_CONF_MOUNT}"
@@ -352,7 +360,7 @@ gluster3_all() {
                 echo "volume flow already mounted"
         else
                 echo "mounting volume flow"
-                mount -t glusterfs localhost:/flow "${GFS_FLOW_MOUNT}"
+                mount -t glusterfs localhost:/flow "${GFS_FLOW_MOUNT}" || return $?
         fi
         #change owner so IPFIXcol running under $USER can write there
         chown "${USER}":"${GROUP}" "${GFS_FLOW_MOUNT}"
