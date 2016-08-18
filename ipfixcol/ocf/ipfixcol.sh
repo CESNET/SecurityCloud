@@ -84,7 +84,7 @@ ipfixcol_start() {
 
         #start ipfixcol
         ocf_log info "${LOG_PREFIX}starting ${IPFIXCOL_BIN} ${ARGS} as user ${OCF_RESKEY_user}"
-        OUT=$(su -s /usr/bin/sh -c "${IPFIXCOL_BIN} ${ARGS}" "${OCF_RESKEY_user}" 2>&1)
+        OUT="$(su -s "/bin/sh" -c "${IPFIXCOL_BIN} ${ARGS}" "${OCF_RESKEY_user}" 2>&1)"
         RC=$?
         #return code of ipfixcol is always 0 because of deamon, but test it anyway :)
         if [ $RC -ne 0 ]
