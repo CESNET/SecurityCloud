@@ -532,8 +532,8 @@ stack1_all() {
         sleep 5 #Pacemaker needs some rest before it is ready for action
 
         #delete "successor" node property (attribute) everywhere
-        crm_attribute --node="$(uname -n)" --name="successor" --delete || return $?
-        #set "successor" node propery (attribute) appropriately
+        crm_attribute "--node=$(uname -n)" "--name=successor" --delete || return $?
+        #set "successor" node property (attribute) appropriately
         local CNT=${#SUB_NODES[*]}
         for ((I=0; I<CNT; I++))
         do
@@ -630,18 +630,6 @@ stack2_one() {
 
         #virtual IP
         pcs_constraint_colocation "virtual-ip" "ipfixcol-proxy-clone" "INFINITY" || return $?
-
-
-        #TODO: should we check IPFIXcol configuration files
-        #echo "checking IPFIXcol configuration files"
-        #if [ ! -e "${GFS_CONF_MOUNT}/ipfixcol/startup-proxy.xml" ]; then
-        #        error "IPFIXcol proxy startup configuration file \"${GFS_CONF_MOUNT}/ipfixcol/startup-proxy.xml\" doesn't exist"
-        #        return 1
-        #fi
-        #if [ ! -e "${GFS_CONF_MOUNT}/ipfixcol/startup-subcollector.xml" ]; then
-        #        error "IPFIXcol subcollector startup configuration file \"${GFS_CONF_MOUNT}/ipfixcol/startup-subcollector.xml\" doesn't exist"
-        #        return 1
-        #fi
 }
 
 pcs_resource_create() {
@@ -656,7 +644,8 @@ pcs_resource_create() {
         fi
 
         echo "resource ${RES_ID}: creating"
-        pcs resource create "${RES_ID}" "${RES_TYPE}" $* --wait || return $?
+        #pcs resource create "${RES_ID}" "${RES_TYPE}" $* --wait || return $?
+        pcs resource create "${RES_ID}" "${RES_TYPE}" $* || return $?
 }
 
 pcs_resource_clone() {
@@ -670,7 +659,8 @@ pcs_resource_clone() {
         fi
 
         echo "clone of the ${RES_ID}: creating"
-        pcs resource clone "${RES_ID}" $* --wait || return $?
+        #pcs resource clone "${RES_ID}" $* --wait || return $?
+        pcs resource clone "${RES_ID}" $* || return $?
 }
 
 pcs_constraint_location() {
