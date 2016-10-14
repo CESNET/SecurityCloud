@@ -39,7 +39,7 @@
 
 import subprocess, re, time, os.path, argparse, warnings
 import shutil, shlex
-
+import signal # SIGTERM handling
 
 MONITOR_INTERVAL = 1 #seconds
 DOWN_LIMIT = 3 #times MONITOR_INTERVAL
@@ -347,6 +347,13 @@ def construct_hosts_and_paths(nodes_dict, setup_dict):
 
     return (slave_names, paths)
 
+def sigterm_handler(signal, frame):
+    """
+    Handler function for processing SIGTERM send from the shell or SCGui
+    """
+    proc.terminate()
+    proc.wait(5)
+    exit(1)
 
 ####################################################################################################
 if __name__ == "__main__":
@@ -394,7 +401,9 @@ if __name__ == "__main__":
 
     fdistdump_args += final_paths
 
-    print("launching command:", ' '.join([shlex.quote(arg) for arg in mpi_args + fdistdump_args]))
+    signal.signal(signal.SIGTERM, sigterm_handler)
+	
+    #print("launching command:", ' '.join([shlex.quote(arg) for arg in mpi_args + fdistdump_args]))
     proc = subprocess.Popen(mpi_args + fdistdump_args)
 
 
