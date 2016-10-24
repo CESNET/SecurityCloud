@@ -190,15 +190,16 @@ check_network() {
 
 check_programs() {
         local OUT RC PROG
+        local GROUP="$(id -gn "${USER}")"
 
         for PROG in ${PROGRAMS[*]}
         do
                 #test presence of the program
-                OUT="$(command -v "${PROG}" 2>&1)"
+                OUT="$(type -f "${PROG}" 2>&1)"
                 RC=$?
                 if [ $RC -ne 0 ]
                 then
-                        error "program \"${PROG}\" is not installed" "command -v ${PROG}" "${OUT}" $RC
+                        error "program \"${PROG}\" is not installed" "type -f ${PROG}" "${OUT}" $RC
                         return $RC
                 fi
         done
@@ -271,7 +272,7 @@ gluster1_all() {
         local GFS_VERSION="$(gluster --version | head -1 | cut -d" " -f 2)" || return $?
         local GFS_PATH="$(find /usr/ -type d -path "/usr/lib*/glusterfs/${GFS_VERSION}")" || return $?
         mkdir -p "${GFS_PATH}/filter/"
-        wget -nv -O "${GFS_PATH}/filter/filter.py" "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/gluster/filter.py" || return $?
+        curl -sS "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/gluster/filter.py" > "${GFS_PATH}/filter/filter.py" || return $?
         chmod +x "${GFS_PATH}/filter/filter.py"
 }
 
@@ -345,6 +346,8 @@ gluster2_one() {
 }
 
 gluster3_all() {
+        local GROUP="$(id -gn "${USER}")"
+
         #mount configuration volume "conf"
         if mountpoint -q "${GFS_CONF_MOUNT}"; then
                 echo "volume conf already mounted"
@@ -384,8 +387,8 @@ ipfixcol1_all() {
         #download and install OCF resource agent
         echo "Downloading OCF resource agent"
         mkdir -p "${OCF_PATH}/cesnet/"
-        wget -nv -O "${OCF_PATH}/cesnet/ipfixcol.sh" "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/ipfixcol/ocf/ipfixcol.sh" || return $?
-        wget -nv -O "${OCF_PATH}/cesnet/ipfixcol.metadata" "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/ipfixcol/ocf/ipfixcol.metadata" || return $?
+        curl -sS "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/ipfixcol/ocf/ipfixcol.sh" > "${OCF_PATH}/cesnet/ipfixcol.sh" || return $?
+        curl -sS "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/ipfixcol/ocf/ipfixcol.metadata" > "${OCF_PATH}/cesnet/ipfixcol.metadata" || return $?
         chmod +x "${OCF_PATH}/cesnet/ipfixcol.sh"
 }
 
@@ -489,13 +492,13 @@ fdistdump() {
 }
 
 fdistdump1_all() {
-        local PATHNAME="$(type -fp fdistdump)"
-        local DIRNAME="$(dirname "${PATHNAME}")"
+        local PATH="/usr/bin"
+        local NAME="fdistdump-ha"
 
         #download and install HA launcher
         echo "Downloading HA launcher"
-        wget -nv -O "${DIRNAME}/fdistdump-ha" "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/fdistdump/fdistdump-ha" || return $?
-        chmod +x "${DIRNAME}/fdistdump-ha"
+        curl -sS "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/fdistdump/${NAME}" > "${PATH}/${NAME}" || return $?
+        chmod +x "${PATH}/${NAME}"
 }
 
 
@@ -719,10 +722,9 @@ fi
 #initialization, default argument values
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 CONF_FILE="${DIR}/install.conf"
-PROGRAMS=(libnf-info ipfixcol fdistdump corosync pacemakerd pcs glusterd gluster ip hostname uname crm_attribute xmllint chown)
+PROGRAMS=(libnf-info ipfixcol corosync pacemakerd pcs glusterd gluster ip hostname uname crm_attribute xmllint chown)
 LIBRARIES=(libnf libcpg)
 USER="hacluster"
-GROUP="$(id -gn "${USER}")"
 
 #check argument count
 if [ $# -lt 1 ]; then
