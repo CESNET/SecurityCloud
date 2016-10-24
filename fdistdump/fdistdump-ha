@@ -37,16 +37,15 @@
 # if advised of the possibility of such damage.
 
 
-import subprocess, re, time, os.path, argparse, warnings
+import subprocess, re, time, os, signal, argparse, warnings
 import shutil, shlex
-import signal # SIGTERM handling
+
 
 MONITOR_INTERVAL = 1 #seconds
 DOWN_LIMIT = 3 #times MONITOR_INTERVAL
 
 binaries = {
     'mpi': 'mpiexec',
-    'fdistdump': 'fdistdump',
     'node': 'crm_node',
     'mon': 'crm_mon',
     'attribute': 'crm_attribute'
@@ -183,7 +182,7 @@ def load_nodes_dict():
 
         succ_id = int(succ_id)
         if succ_id not in ids:
-            raise KeyError('node {} has invalid successor id {}'.format(id, succ_id))
+            raise KeyError('node "{}" has invalid successor id "{}".'.format(id, succ_id))
         else:
             nodes_dict[id]['successor'] = succ_id
 
@@ -198,7 +197,7 @@ def load_setup_dict():
     for attribute in ['flow-primary-brick', 'flow-backup-brick']:
         value = get_cluster_attribute(attribute)
         if value is None:
-            raise Exception('cluster attribute "{}" is not defined'.format(attribute))
+            raise Exception('cluster attribute "{}" is not defined.'.format(attribute))
         else:
             setup_dict[attribute] = value
 
@@ -251,7 +250,7 @@ def graph_check_validity(nodes_dict):
     succ_id = nodes_dict[node_id]['successor']
 
     if node_id == succ_id:
-        warnings.warn('Self-loop doesn\'t make sense.')
+        warnings.warn('self-loop doesn\'t make sense.')
         return True
 
     while succ_id in subcoll_set:
@@ -312,12 +311,12 @@ def construct_hosts_and_paths(nodes_dict, setup_dict):
                     master_name = nodes_dict[sub]['name']
                     break
         else: #no master found at all
-            raise Exception('no node suitable for master found')
+            raise Exception('no node suitable for master found.')
 
 
     #at least one online subcollector is mandatory
     if subcollector_set.isdisjoint(online_set):
-        raise Exception('no online subcollector found')
+        raise Exception('no online subcollector found.')
 
     #add all online subcollector nodes as slaves
     for sub in subcollector_set:
@@ -331,7 +330,7 @@ def construct_hosts_and_paths(nodes_dict, setup_dict):
             succ = nodes_dict[sub]['successor']
             succ_name = nodes_dict[succ]['name']
 
-            warn_msg = 'Node {} ({}) isn\'t online, '.format(sub, sub_name)
+            warn_msg = 'node {} ({}) isn\'t online, '.format(sub, sub_name)
             if succ in online_set: #is successor online?
                 paths.append(os.path.join('%{}:'.format(slave_names.index(succ_name) + 1) + \
                                 setup_dict['flow-backup-brick'], sub_name))
@@ -347,20 +346,36 @@ def construct_hosts_and_paths(nodes_dict, setup_dict):
 
     return (slave_names, paths)
 
-def sigterm_handler(signal, frame):
-    """
-    Handler function for processing SIGTERM send from the shell or SCGui
-    """
+def signal_handler(signal, frame):
+    if 'proc' not in globals():
+        warnings.warn('query has not been started yet.')
+        return
+
+    #When signal is sent to the process group (which is the same for the fdistdump-ha and fdistdump),
+    #MPI will terminate query in a usual way but it can take a while (therefore the sleep()).
+    warnings.warn('waiting for query self-termination.')
+    for i in range(5):
+        time.sleep(1)
+        if proc.poll() is not None:
+            return
+
+    #When signal is sent only to the fdistdump-ha process (or MPI for some reason couldn terminate
+    #it by itself), its our responsibility to terminate the query.
+    warnings.warn('terminating query.')
     proc.terminate()
     proc.wait(5)
-    exit(1)
+
 
 ####################################################################################################
 if __name__ == "__main__":
+    #construct fdistdump binary name and add id to the binaries dictionary
+    mpi_suffix = os.environ.get('MPI_SUFFIX')
+    binaries['fdistdump'] = 'fdistdump' if mpi_suffix is None else 'fdistdump' + mpi_suffix
+
     #check presence of used binaries
     for key, value in binaries.items():
         if shutil.which(value) is None:
-            raise OSError('Executable "{}" not found.'.format(value))
+            raise OSError('executable "{}" not found.'.format(value))
 
     #set my format for warning
     warnings.formatwarning = myformatwarning
@@ -385,11 +400,19 @@ if __name__ == "__main__":
     online_set_ref = get_online_set()
     hosts, base_paths = construct_hosts_and_paths(nodes_dict, setup_dict)
 
+    #pick only relative paths
+    user_paths = []
+    for path in args.path:
+        if path[0] == '/':
+            warnings.warn('skipping absolute path "{}".'.format(path))
+        else:
+            user_paths.append(path)
+    if len(user_paths) == 0:
+        raise ValueError('no valid path.')
 
-    #TODO: should I strip initial slashes in user paths?
     final_paths = []
     for base_path in base_paths:
-        final_paths += [shlex.quote(os.path.join(base_path, user_path)) for user_path in args.path]
+        final_paths += [shlex.quote(os.path.join(base_path, user_path)) for user_path in user_paths]
 
     mpi_args = [binaries['mpi'], '-wdir', '/tmp/', '-host', ','.join(hosts)] #comma separated list of hosts on which to invoke processes
     if args.mpi_user_args:
@@ -401,8 +424,10 @@ if __name__ == "__main__":
 
     fdistdump_args += final_paths
 
-    signal.signal(signal.SIGTERM, sigterm_handler)
-	
+    #attach handler to SIGINT and SIGTERM for gracefull query termination
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     #print("launching command:", ' '.join([shlex.quote(arg) for arg in mpi_args + fdistdump_args]))
     proc = subprocess.Popen(mpi_args + fdistdump_args)
 
@@ -412,15 +437,13 @@ if __name__ == "__main__":
     while proc.poll() is None:
         if online_set_ref > get_online_set():
             node_down_for += 1
-            warn_msg = '{}/{}: one or more nodes where query is running went offline.'.format(node_down_for, DOWN_LIMIT)
-            warnings.warn(warn_msg)
+            warnings.warn('one or more nodes where query is running went offline.')
         elif node_down_for != 0:
-            warn_msg = 'All nodes where query is running are back online.'
-            warnings.warn(warn_msg)
+            warnings.warn('all nodes where query is running are back online.')
             node_down_for = 0
 
         if node_down_for >= DOWN_LIMIT:
-            warnings.warn('Terminating query.')
+            warnings.warn('node offline limit exceeded, terminating query.')
             proc.terminate()
             proc.wait(5)
             break
@@ -430,5 +453,4 @@ if __name__ == "__main__":
 
     if proc.returncode != 0:
         warnings.warn('MPI process manager returned {}.'.format(proc.returncode))
-    else:
-        exit(proc.returncode)
+    exit(proc.returncode)
