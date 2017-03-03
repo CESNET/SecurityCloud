@@ -498,7 +498,7 @@ fdistdump1_all() {
         #download and install HA launcher
         echo "Downloading HA launcher"
         curl -sS
-	"https://raw.githubusercontent.com/CESNET/SecurityCloud/master/fdistdump/${NAME}" >"${DOWNLOAD_PATH}/${NAME}" || return $?
+        "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/fdistdump/${NAME}" >"${DOWNLOAD_PATH}/${NAME}" || return $?
         chmod +x "${DOWNLOAD_PATH}/${NAME}"
 }
 
@@ -523,13 +523,20 @@ stack1_all() {
                 fi
         fi
 
-        #setup corosync localy for all nodes (we are not using pcsd), start and enable corosync and pacemaker
+        #setup corosync localy for all nodes (we are not using pcsd)
         pcs cluster setup --local --name "security_cloud" ${ALL_NODES[*]} --force || return $?
-        pcs cluster start || return $?
-        #pcs cluster enable || return $? #doesn't work on debian
-        systemctl enable corosync.service || return $?
-        #as a precaution we want to prevent pacemaker from starting immediately on our nodes
-        #systemctl enable pacemaker.service || return $?
+
+        #start and enable corosync, start pacemaker (as a precaution we want to
+        #prevent pacemaker from starting immediately on our nodes after reboot)
+        if [ -f /.dockerenv ]; then
+                #inside docker container
+                /etc/init.d/corosync start || return $?
+                /etc/init.d/corosync enable || return $?
+                /etc/init.d/pacemaker start || return $?
+        else
+                pcs cluster start || return $?
+                systemctl enable corosync.service || return $?
+        fi
 
         #verify
         corosync-cpgtool > /dev/null || return $?
