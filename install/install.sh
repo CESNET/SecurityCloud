@@ -531,7 +531,6 @@ stack1_all() {
         if [ -f /.dockerenv ]; then
                 #inside docker container
                 /etc/init.d/corosync start || return $?
-                /etc/init.d/corosync enable || return $?
                 /etc/init.d/pacemaker start || return $?
         else
                 pcs cluster start || return $?
