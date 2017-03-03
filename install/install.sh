@@ -492,13 +492,14 @@ fdistdump() {
 }
 
 fdistdump1_all() {
-        local PATH="/usr/bin"
+        local DOWNLOAD_PATH="/usr/bin"
         local NAME="fdistdump-ha"
 
         #download and install HA launcher
         echo "Downloading HA launcher"
-        curl -sS "https://raw.githubusercontent.com/CESNET/SecurityCloud/master/fdistdump/${NAME}" > "${PATH}/${NAME}" || return $?
-        chmod +x "${PATH}/${NAME}"
+        curl -sS
+	"https://raw.githubusercontent.com/CESNET/SecurityCloud/master/fdistdump/${NAME}" >"${DOWNLOAD_PATH}/${NAME}" || return $?
+        chmod +x "${DOWNLOAD_PATH}/${NAME}"
 }
 
 
