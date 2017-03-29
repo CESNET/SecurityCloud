@@ -381,11 +381,18 @@ if __name__ == "__main__":
     warnings.formatwarning = myformatwarning
 
     #parse command line arguments
-    parser = argparse.ArgumentParser(description ='fdistdump(1) wrapper with support for high-availability using Corosync/Pacemaker stack.')
-    parser.add_argument('-m', '--mpi-args', dest = 'mpi_user_args', help = 'arguments passed to the mpiexec(1) command')
-    parser.add_argument('-f', '--fdistdump-args', dest = 'fdistdump_user_args', help = 'arguments passed to the fdistdump(1) command')
-    parser.add_argument('path', nargs='+', help = 'Path to your flow file/directory relative to the "flow-primary-brick" Pacemaker property, \
-                    e.g. path will be simply "2016/07/" if you want to process all flow files from July 2016.')
+    parser = argparse.ArgumentParser(description ='fdistdump(1) wrapper with support for \
+            high-availability using Corosync/Pacemaker stack.')
+    parser.add_argument('-m', '--mpi-args', dest = 'user_mpi_args', help = 'Arguments passed to \
+            the mpiexec(1) command.')
+    parser.add_argument('-f', '--fdistdump-args', dest = 'user_fdistdump_args', help = 'Arguments \
+            passed to the fdistdump(1) command.')
+    parser.add_argument('-p', '--priority', dest = 'priority', choices = ['low', 'normal', 'high'],
+            help = 'Run fdistdump with adjusted niceness and I/O scheduling class. For more \
+                    information see nice(1) and ionice(1).')
+    parser.add_argument('path', nargs='+', help = 'Path to your flow file/directory relative to \
+            the "flow-primary-brick" Pacemaker property, e.g. path will be simply "2016/07/" if \
+            you want to process all flow files from July 2016.')
     args = parser.parse_args()
 
     #initialize dictionaries
@@ -414,13 +421,22 @@ if __name__ == "__main__":
     for base_path in base_paths:
         final_paths += [shlex.quote(os.path.join(base_path, user_path)) for user_path in user_paths]
 
-    mpi_args = [binaries['mpi'], '-wdir', '/tmp/', '-host', ','.join(hosts)] #comma separated list of hosts on which to invoke processes
-    if args.mpi_user_args:
-        mpi_args += shlex.split(args.mpi_user_args)
+    #construct MPI arguments
+    mpi_args = [binaries['mpi'], '-wdir', '/tmp/', '-host', ','.join(hosts)] #comma separated list
+    if args.user_mpi_args:
+        mpi_args += shlex.split(args.user_mpi_args)
 
+    #handle priority classes
+    priority_args = [] #don't change anything if class not set or set to normal
+    if args.priority == 'low':
+        priority_args = ['nice', '-n', '10', 'ionice', '-c', '3']
+    elif args.priority == 'high':
+        priority_args = ['nice', '-n', '-10', 'ionice', '-c', '1']
+
+    #construct fdistdump arguments
     fdistdump_args = [binaries['fdistdump']]
-    if args.fdistdump_user_args:
-        fdistdump_args += shlex.split(args.fdistdump_user_args)
+    if args.user_fdistdump_args:
+        fdistdump_args += shlex.split(args.user_fdistdump_args)
 
     fdistdump_args += final_paths
 
@@ -429,7 +445,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, signal_handler)
 
     #print("launching command:", ' '.join([shlex.quote(arg) for arg in mpi_args + fdistdump_args]))
-    proc = subprocess.Popen(mpi_args + fdistdump_args)
+    proc = subprocess.Popen(mpi_args + priority_args + fdistdump_args)
 
 
     #start monitoring loop
