@@ -48,6 +48,7 @@
 #       OCF_RESKEY_user
 #       OCF_RESKEY_group
 #       OCF_RESKEY_reconf_trigger
+#       OCF_RESKEY_priority
 #
 # OCF instance parameters (for resource):
 #       OCF_RESKEY_startup_conf
@@ -105,11 +106,25 @@ ipfixcol_start() {
                 sleep 1 #wait for startup
         done
 
+        #adjust niceness and I/O scheduling class
+        local PIDLIST=$(cat "$PIDFILE" | tr "\n" " ")
+        case "$OCF_RESKEY_priority" in
+                low)
+                        renice -n 10 -g $PIDLIST
+                        ionice -c 3 -p $(get_tids $PIDLIST) #idle
+                        ;;
+                high)
+                        renice -n -10 -g $PIDLIST
+                        ionice -c 1 -p $(get_tids $PIDLIST) #realtime
+                        ;;
+                *) #not set or normal -> don't change anything
+                        ;;
+        esac
+
         return $OCF_SUCCESS
 }
 
 ipfixcol_stop() {
-        local PIDLIST
         local TIMEOUT=5 #stop timeout
         local WAITING=0
 
@@ -121,7 +136,7 @@ ipfixcol_stop() {
                 return $OCF_SUCCESS
         fi
 
-        PIDLIST=$(cat "$PIDFILE" | tr "\n" " ") #pidfile exists
+        local PIDLIST=$(cat "$PIDFILE" | tr "\n" " ") #pidfile exists
 
         #first use SIGTERM, if not successfull then use SIGKILL on PIDs from pidfile
         for SIGNAL in TERM KILL; do
@@ -256,6 +271,16 @@ following monitor action) find this file and reconfigure itself.
 <content type="string" />
 </parameter>
 
+<parameter name="priority" unique="0" required="0">
+<longdesc lang="en">
+Run the resource with adjusted niceness and I/O scheduling class. For more
+information see nice(1) and ionice(1). Valid values are low, normal and high.
+</longdesc>
+<shortdesc lang="en">Resource CPU and IO niceness.</shortdesc>
+<content type="string" default="normal" />
+</parameter>
+
+
 
 <parameter name="startup_conf" unique="0" required="0">
 <longdesc lang="en">
@@ -357,6 +382,18 @@ ipfixcol_validate_shallow() {
                 ocf_exit_reason "${ERR}"
                 return $OCF_ERR_CONFIGURED
         fi
+
+        #priority class test
+        case "$OCF_RESKEY_priority" in
+                low) ;;
+                normal) ;;
+                high) ;;
+                *)
+                        ERR="invalid priority class: \"${OCF_RESKEY_priority}\""
+                        ocf_log err "${LOG_PREFIX}${ERR}"
+                        ocf_exit_reason "${ERR}"
+                        return $OCF_ERR_CONFIGURED
+        esac
 
         return $OCF_SUCCESS
 }
@@ -493,6 +530,31 @@ reload_configuration() {
         fi
 }
 
+#for each PID return all thread IDs in the process
+get_tids() {
+        #/proc/[pid]/task is a directory that contains one subdirectory for each
+        #thread in the process (named by its thread ID)
+        for PID in $*; do
+                ls "/proc/$1/task/"
+        done
+
+        #return only unique?
+        #echo $TIDS | tr " " "\n" | sort -u | tr "\n" " "
+}
+
+get_pids() {
+        #/proc/[pid]/task/[tid]/children is a space-separated list of child
+        #tasks of this task
+
+        local TID_PATH TID CHILD_TASK
+        for TID_PATH in /proc/$1/task/*; do
+                TID="$(basename "$TID_PATH")"
+                PID_LIST="${PID_LIST}${TID} "
+                for CHILD_TASK in $(cat ${TID_PATH}/children); do
+                        findpids $CHILD_TASK
+                done
+        done
+}
 ################################################################################
 
 #initialization
@@ -502,9 +564,11 @@ reload_configuration() {
 #use supplied values or default values
 OCF_RESKEY_binary_default=ipfixcol
 OCF_RESKEY_user_default=hacluster
+OCF_RESKEY_priority_default=normal
 : "${OCF_RESKEY_binary="${OCF_RESKEY_binary_default}"}"
 : "${OCF_RESKEY_user="${OCF_RESKEY_user_default}"}"
 : "${OCF_RESKEY_group="$(id -gn "${OCF_RESKEY_user}")"}"
+: "${OCF_RESKEY_priority="${OCF_RESKEY_priority_default}"}"
 
 #initialize global constants
 readonly PIDFILE="${HA_VARRUN}/ipfixcol/${OCF_RESKEY_role}.pid"
