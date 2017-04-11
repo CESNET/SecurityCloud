@@ -1,4 +1,4 @@
-#!/usr/bin/env sh
+#!/bin/sh
 #
 #
 # Description: OCF RA for IPFIXcol, the collector for capturing IPFIX NetFlow
@@ -69,14 +69,14 @@ ipfixcol_start() {
         #if resource is already running, return success immediately
         if ipfixcol_monitor; then
                 ocf_log info "${LOG_PREFIX}already running"
-                return $OCF_SUCCESS
+                return "$OCF_SUCCESS"
         fi
 
         #non root users cannon write directly to /var/run/
         ocf_log debug "${LOG_PREFIX}creating PIDfile directory " \
-                "$(dirname "${PIDFILE}") as a ${OCF_RESKEY_user}":"${OCF_RESKEY_group}"
+                "$(dirname "${PIDFILE}") as a ${OCF_RESKEY_user}:${OCF_RESKEY_group}"
         mkdir -p "$(dirname "${PIDFILE}")"
-        chown "${OCF_RESKEY_user}":"${OCF_RESKEY_group}" "$(dirname "${PIDFILE}")"
+        chown "${OCF_RESKEY_user}:${OCF_RESKEY_group}" "$(dirname "${PIDFILE}")"
 
 
         #construct arguments
@@ -96,32 +96,31 @@ ipfixcol_start() {
         if [ $RC -ne 0 ]; then
                 ERR="IPFIXcol start failed, RC = ${RC}, OUT = ${OUT}"
                 ocf_log err "${LOG_PREFIX}${ERR}"
-                ocf_exit_reason "${ERR}"
-                return $OCF_ERR_GENERIC
+                return "$OCF_ERR_GENERIC"
         fi
 
-        #spin on monitor unitl it succeeds
+        #spin on monitor until it succeeds or until Pacemaker's timeout kicks in
         while ! ipfixcol_monitor; do
-                ocf_log debug "${LOG_PREFIX}after startup monitor spin"
+                ocf_log debug "${LOG_PREFIX}after start monitor spin"
                 sleep 1 #wait for startup
         done
 
         #adjust niceness and I/O scheduling class
-        local PIDLIST=$(cat "$PIDFILE" | tr "\n" " ")
+        local PIDLIST=$(get_pidlist)
         case "$OCF_RESKEY_priority" in
                 low)
-                        renice -n 10 -g $PIDLIST
+                        renice -n 10 -g $PIDLIST >/dev/null
                         ionice -c 3 -p $(get_tids $PIDLIST) #idle
                         ;;
                 high)
-                        renice -n -10 -g $PIDLIST
+                        renice -n -10 -g $PIDLIST >/dev/null
                         ionice -c 1 -p $(get_tids $PIDLIST) #realtime
                         ;;
                 *) #not set or normal -> don't change anything
                         ;;
         esac
 
-        return $OCF_SUCCESS
+        return "$OCF_SUCCESS"
 }
 
 ipfixcol_stop() {
@@ -133,35 +132,43 @@ ipfixcol_stop() {
         #if resource is already stopped, return success immediately
         if ! ipfixcol_monitor; then
                 ocf_log info "${LOG_PREFIX}not running"
-                return $OCF_SUCCESS
+                return "$OCF_SUCCESS"
         fi
 
-        local PIDLIST=$(cat "$PIDFILE" | tr "\n" " ") #pidfile exists
+        local PIDLIST=$(get_pidlist) #pidfile exists
 
-        #first use SIGTERM, if not successfull then use SIGKILL on PIDs from pidfile
+        #send SIGTERM to all PIDs from pidfile, in case it's not successfull send SIGKILL
         for SIGNAL in TERM KILL; do
-                ocf_log info "${LOG_PREFIX}sending SIG${SIGNAL} to PID(s) $PIDLIST"
-                kill -s ${SIGNAL} $PIDLIST
+                if kill -s "${SIGNAL}" $PIDLIST; then
+                        ocf_log info "${LOG_PREFIX}sent SIG${SIGNAL} to PID(s) $PIDLIST"
+                else
+                        ocf_log warn "${LOG_PREFIX}failed to send SIG${SIGNAL} to PID(s) $PIDLIST"
+                fi
 
                 while [ $WAITING -lt $TIMEOUT ]; do
                         sleep 1
                         WAITING=$((WAITING+1))
 
                         ipfixcol_monitor
-                        if [ $? -eq $OCF_NOT_RUNNING ]; then
+                        if [ $? -eq "$OCF_NOT_RUNNING" ]; then
                                 ocf_log info "${LOG_PREFIX}SIG${SIGNAL} successfully stopped all PIDs"
                                 rm -f "${PIDFILE}" #in case IPFIXcol didn't delete it
-                                return $OCF_SUCCESS
+                                return "$OCF_SUCCESS"
                         fi
                 done
 
                 ocf_log warn "${LOG_PREFIX}SIG${SIGNAL} failed to stop one or more PIDs"
         done
 
-        ERR="failed to stop"
-        ocf_log err "${LOG_PREFIX}${ERR}"
-        ocf_exit_reason "${ERR}"
-        return $OCF_ERR_GENERIC
+        #spin on monitor until all PIDs are dead or until Pacemaker's timeout kicks in
+        while (ipfixcol_monitor; [ $? -ne "$OCF_NOT_RUNNING" ]); do
+                ocf_log debug "${LOG_PREFIX}after stop monitor spin"
+                sleep 1
+        done
+
+        ocf_log info "${LOG_PREFIX}successfully stopped all PIDs"
+        rm -f "${PIDFILE}" #in case IPFIXcol didn't delete it
+        return "$OCF_SUCCESS"
 }
 
 ipfixcol_monitor() {
@@ -171,28 +178,30 @@ ipfixcol_monitor() {
         ocf_log debug "${LOG_PREFIX}ipfixcol_monitor()"
 
         #does pidfile exist?
-        [ -f "$PIDFILE" ] || return $OCF_NOT_RUNNING #no pidfile, nothing should be running
+        [ -f "$PIDFILE" ] || return "$OCF_NOT_RUNNING" #no pidfile, nothing should be running
         ocf_log debug "${LOG_PREFIX}have pidfile"
 
         PROC_PIDFILE_CNT=$(wc -l "$PIDFILE" | cut "-d " -f 1)
 
-        for PID in $(cat "${PIDFILE}"); do
-                kill -s 0 "${PID}" 2> /dev/null && PROC_RUNNING_CNT=$((PROC_RUNNING_CNT+1))
-        done
+        while read PID; do
+                if kill -s 0 "$PID" 2>/dev/null; then
+                        PROC_RUNNING_CNT=$((PROC_RUNNING_CNT+1))
+                fi
+        done <"$PIDFILE"
 
         if [ $PROC_RUNNING_CNT -eq 0 ]; then
                 #no process from pidfile is running, delete it
                 ocf_log debug "${LOG_PREFIX}no process from pidfile is running, deleteting pidfile"
                 rm -f "${PIDFILE}"
-                return $OCF_NOT_RUNNING
-        elif [ $PROC_RUNNING_CNT -eq $PROC_PIDFILE_CNT ]; then
+                return "$OCF_NOT_RUNNING"
+        elif [ "$PROC_RUNNING_CNT" -eq "$PROC_PIDFILE_CNT" ]; then
                 #all processes from pidfile are running
                 ocf_log debug "${LOG_PREFIX}all processes from pidfile are running"
-                return $OCF_SUCCESS
+                return "$OCF_SUCCESS"
         else
                 #some processes are running, some not
                 ocf_log err "${LOG_PREFIX}some PIDs from pidfile are running, some not"
-                return $OCF_ERR_GENERIC
+                return "$OCF_ERR_GENERIC"
         fi
 }
 
@@ -249,6 +258,15 @@ Value can be a group name or numeric group ID.
 <content type="string" default="user's effective group ID" />
 </parameter>
 
+<parameter name="priority" unique="0" required="0">
+<longdesc lang="en">
+Run the resource with adjusted niceness and I/O scheduling class. For more
+information see nice(1) and ionice(1). Valid values are low, normal and high.
+</longdesc>
+<shortdesc lang="en">Resource CPU and IO niceness.</shortdesc>
+<content type="string" default="normal" />
+</parameter>
+
 <parameter name="reconf_trigger" unique="0" required="0">
 <longdesc lang="en">
 When this parameter is set, RA will treat its value as a path to the
@@ -263,23 +281,35 @@ nothing happens.
 Reconfiguration trigger file is useful especially when you have several clone
 instances and cannot/don't want to manually send SIGUSR1 to every IPFIXcol
 process to make it reload its startup configuration. Just set reconf_trigger to
-soma shared location and when you are done with configuration file changes,
+some shared location and when you are done with configuration file changes,
 create and empty file on that location. Each instance will eventually (on the
 following monitor action) find this file and reconfigure itself.
+
+Alternative to this parameter is the reload_trigger. You can use whichever
+suites you more.
 </longdesc>
 <shortdesc lang="en">Reconfiguration trigger file.</shortdesc>
 <content type="string" />
 </parameter>
 
-<parameter name="priority" unique="0" required="0">
+<parameter name="reload_trigger" unique="0" required="0">
 <longdesc lang="en">
-Run the resource with adjusted niceness and I/O scheduling class. For more
-information see nice(1) and ionice(1). Valid values are low, normal and high.
-</longdesc>
-<shortdesc lang="en">Resource CPU and IO niceness.</shortdesc>
-<content type="string" default="normal" />
-</parameter>
+Fake parameter that can be changed to an arbitraty value to cause a reload
+action, which will make the IPIFXcol reload its startup configuration (by sendig
+SIGUSR1 to the IPFIXcol's PID).
 
+Reconfiguration trigger is useful especially when you have several clone
+instances and cannot/don't want to manually send SIGUSR1 to every IPFIXcol
+process to make it reload its startup configuration. Just set reload_trigger to
+an arbitraty when you are done with configuration file changes. Each instance
+should immediately perform reconf action and reconfigure itself.
+
+Alternative to this parameter is the reconf_trigger. You can use whichever
+suites you more.
+</longdesc>
+<shortdesc lang="en">Fake attribute that can be changed to cause a reload</shortdesc>
+<content type="string" default="dummy" />
+</parameter>
 
 
 <parameter name="startup_conf" unique="0" required="0">
@@ -330,6 +360,7 @@ Any valid additional IPFIXcol arguments.
 <action name="start" timeout="20" />
 <action name="stop" timeout="20" />
 <action name="monitor" timeout="20" interval="10" depth="0" />
+<action name="reload" timeout="20" />
 <action name="meta-data" timeout="5" />
 <action name="validate-all" timeout="5" />
 </actions>
@@ -340,7 +371,7 @@ END
 
 ipfixcol_validate_shallow() {
         if [ -n "$VALIDATED_SHALLOWLY" ]; then
-                return $OCF_SUCCESS
+                return "$OCF_SUCCESS"
         else
                 VALIDATED_SHALLOWLY=1
                 ocf_log debug "${LOG_PREFIX}ipfixcol_validate_shallow()"
@@ -353,8 +384,7 @@ ipfixcol_validate_shallow() {
         if [ "$OCF_RESKEY_role" != proxy -a "$OCF_RESKEY_role" != subcollector ]; then
                 ERR="invalid role \"${OCF_RESKEY_role}\""
                 ocf_log err "${LOG_PREFIX}${ERR}"
-                ocf_exit_reason "${ERR}"
-                return $OCF_ERR_CONFIGURED
+                return "$OCF_ERR_CONFIGURED"
         fi
 
         #verbosity integer test
@@ -363,24 +393,21 @@ ipfixcol_validate_shallow() {
         then
                 ERR="invalid verbosity value: \"${OCF_RESKEY_verbosity}\""
                 ocf_log err "${LOG_PREFIX}${ERR}"
-                ocf_exit_reason "${ERR}"
-                return $OCF_ERR_CONFIGURED
+                return "$OCF_ERR_CONFIGURED"
         fi
 
         #user existence test
         if ! getent passwd "${OCF_RESKEY_user}" >/dev/null; then
                 ERR="user \"${OCF_RESKEY_user}\" doesn't exist"
                 ocf_log err "${LOG_PREFIX}${ERR}"
-                ocf_exit_reason "${ERR}"
-                return $OCF_ERR_CONFIGURED
+                return "$OCF_ERR_CONFIGURED"
         fi
 
         #group existence test
         if ! getent group "${OCF_RESKEY_group}" >/dev/null; then
                 ERR="group \"${OCF_RESKEY_group}\" doesn't exist"
                 ocf_log err "${LOG_PREFIX}${ERR}"
-                ocf_exit_reason "${ERR}"
-                return $OCF_ERR_CONFIGURED
+                return "$OCF_ERR_CONFIGURED"
         fi
 
         #priority class test
@@ -391,18 +418,17 @@ ipfixcol_validate_shallow() {
                 *)
                         ERR="invalid priority class: \"${OCF_RESKEY_priority}\""
                         ocf_log err "${LOG_PREFIX}${ERR}"
-                        ocf_exit_reason "${ERR}"
-                        return $OCF_ERR_CONFIGURED
+                        return "$OCF_ERR_CONFIGURED"
         esac
 
-        return $OCF_SUCCESS
+        return "$OCF_SUCCESS"
 }
 
 ipfixcol_validate_deep() {
         ipfixcol_validate_shallow || return $?
 
         if [ -n "$VALIDATED_DEEPLY" ]; then
-                return $OCF_SUCCESS
+                return "$OCF_SUCCESS"
         else
                 VALIDATED_DEEPLY=1
                 ocf_log debug "${LOG_PREFIX}ipfixcol_validate_deep()"
@@ -411,27 +437,55 @@ ipfixcol_validate_deep() {
         if [ -n "$OCF_RESKEY_startup_conf" -a ! -f "$OCF_RESKEY_startup_conf" ]; then
                 ERR="startup configuration file doesn't exist: \"${OCF_RESKEY_startup_conf}\""
                 ocf_log err "${LOG_PREFIX}${ERR}"
-                ocf_exit_reason "${ERR}"
-                return $OCF_ERR_INSTALLED
+                return "$OCF_ERR_INSTALLED"i
         fi
 
         if [ -n "$OCF_RESKEY_internal_conf" -a ! -f "$OCF_RESKEY_internal_conf" ]; then
                 ERR="internal configuration file doesn't exist: \"${OCF_RESKEY_internal_conf}\""
                 ocf_log err "${LOG_PREFIX}${ERR}"
-                ocf_exit_reason "${ERR}"
-                return $OCF_ERR_INSTALLED
+                return "$OCF_ERR_INSTALLED"
         fi
 
         if [ -n "$OCF_RESKEY_ipfix_elements" -a ! -f "$OCF_RESKEY_ipfix_elements" ]; then
                 ERR="IPFIX elements set file doesn't exist: \"${OCF_RESKEY_ipfix_elements}\""
                 ocf_log err "${LOG_PREFIX}${ERR}"
-                ocf_exit_reason "${ERR}"
-                return $OCF_ERR_INSTALLED
+                return "$OCF_ERR_INSTALLED"
         fi
 
         #how to test $OCF_RESKEY_additional_args?
 
-        return $OCF_SUCCESS
+        return "$OCF_SUCCESS"
+}
+
+ipfixcol_reload() {
+        ocf_log debug "${LOG_PREFIX}ipfixcol_reload()"
+
+        #if resource is stopped, return immediately
+        if ! ipfixcol_monitor; then
+                ocf_log info "${LOG_PREFIX}not running"
+                return "$OCF_SUCCESS"
+        fi
+
+        #deep validation because of startup configuration file
+        ipfixcol_validate_deep
+        RC=$?
+        if [ "$RC" -ne "$OCF_SUCCESS" ]; then
+                ERR="validation before reconfiguration failed"
+                ocf_log err "${LOG_PREFIX}${ERR}"
+                return "$RC"
+        fi
+
+        #send reconfiguration signal (SIGUSR1) to all resource processes
+        local SIGNAL=USR1
+        local PIDLIST=$(get_pidlist)
+        if kill -s ${SIGNAL} $PIDLIST; then
+                ocf_log debug "${LOG_PREFIX}sent SIG${SIGNAL} to PID(s) $PIDLIST"
+                return "$OCF_SUCCESS"
+        else
+                ERR="failed to send SIG${SIGNAL} to PID(s) $PIDLIST"
+                ocf_log err "${LOG_PREFIX}${ERR}"
+                return "$OCF_ERR_GENERIC"
+        fi
 }
 
 ################################################################################
@@ -445,7 +499,7 @@ dispatch_action() {
                 meta-data)
                         #print metadata
                         ipfixcol_metadata
-                        return $OCF_SUCCESS
+                        return "$OCF_SUCCESS"
                         ;;
         esac
 
@@ -463,17 +517,17 @@ dispatch_action() {
                         ipfixcol_monitor
                         local MONITOR_RC=$?
 
-                        if [ $MONITOR_RC -eq $OCF_SUCCESS -a \
+                        if [ "$MONITOR_RC" -eq "$OCF_SUCCESS" -a \
                                 -n "$OCF_RESKEY_reconf_trigger" ]
                         then
-                                reload_configuration #do a reconfiguration attemp
+                                reconf_trigger #do a reconfiguration attemp
                         fi
 
-                        return $MONITOR_RC
+                        return "$MONITOR_RC"
                         ;;
         esac
 
-        #deep validation on start and validate-all
+        #deep validation on start, reload and validate-all
         ipfixcol_validate_deep || return $?
 
         case "$__OCF_ACTION" in
@@ -482,22 +536,26 @@ dispatch_action() {
                         ipfixcol_start
                         return $?
                         ;;
+                reload)
+                        #reload resource's configuration
+                        ipfixcol_reload
+                        return $?
+                        ;;
                 validate-all)
                         #already validated
-                        return $OCF_SUCCESS
+                        return "$OCF_SUCCESS"
                         ;;
                 *)
                         #anything else is error
                         ERR="unimplemented OCF action \"$__OCF_ACTION\""
                         ocf_log err "${LOG_PREFIX}${ERR}"
-                        ocf_exit_reason "${ERR}"
-                        return $OCF_ERR_UNIMPLEMENTED
+                        return "$OCF_ERR_UNIMPLEMENTED"
                         ;;
         esac
 }
 
-reload_configuration() {
-        ocf_log debug "${LOG_PREFIX}reload_configuration()"
+reconf_trigger() {
+        ocf_log debug "${LOG_PREFIX}reconf_trigger()"
 
         local FQDN
         readonly FQDN="$(hostname --fqdn)"
@@ -518,14 +576,9 @@ reload_configuration() {
                         return
                 fi
 
-                #send reconfiguration signal (SIGUSR1) and mark the trigger file
-                #as triggered by this node (write there my FQDN)
-                local SIGNAL=USR1
-                if kill -s ${SIGNAL} "$(head -1 "${PIDFILE}")"; then
-                        ocf_log debug "${LOG_PREFIX}sent SIG${SIGNAL} to PID ${1}"
-                        echo $FQDN >>"$OCF_RESKEY_reconf_trigger"
-                else
-                        ocf_log debug "${LOG_PREFIX}failed to send SIG${SIGNAL} to PID ${1}"
+                if ipfixcol_reload; then
+                        #mark the trigger file as triggered by this node
+                        echo "$FQDN" >>"$OCF_RESKEY_reconf_trigger"
                 fi
         fi
 }
@@ -534,7 +587,7 @@ reload_configuration() {
 get_tids() {
         #/proc/[pid]/task is a directory that contains one subdirectory for each
         #thread in the process (named by its thread ID)
-        for PID in $*; do
+        for PID in "$@"; do
                 ls "/proc/$1/task/"
         done
 
@@ -550,16 +603,20 @@ get_pids() {
         for TID_PATH in /proc/$1/task/*; do
                 TID="$(basename "$TID_PATH")"
                 PID_LIST="${PID_LIST}${TID} "
-                for CHILD_TASK in $(cat ${TID_PATH}/children); do
-                        findpids $CHILD_TASK
+                for CHILD_TASK in $(cat "${TID_PATH}/children"); do
+                        get_pids "$CHILD_TASK"
                 done
         done
+}
+
+get_pidlist() {
+        tr "\n" " " <"$PIDFILE"
 }
 ################################################################################
 
 #initialization
-: ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
-. ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+: "${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}"
+. "${OCF_FUNCTIONS_DIR}/ocf-shellfuncs"
 
 #use supplied values or default values
 OCF_RESKEY_binary_default=ipfixcol
@@ -579,11 +636,14 @@ if [ $# -ne 1 ]; then
         ERR="bad number of arguments ($#): $*"
         ocf_log err "${LOG_PREFIX}${ERR}"
         ocf_exit_reason "${ERR}"
-        exit $OCF_ERR_GENERIC
+        exit "$OCF_ERR_GENERIC"
 fi
 
 dispatch_action
 RC=$?
 
 ocf_log debug "${LOG_PREFIX}exitting (RC=${RC})"
+if [ -n "$ERR" ]; then
+        ocf_exit_reason "${ERR}" #set last ERR as exit reason
+fi
 exit $RC
