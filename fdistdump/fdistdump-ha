@@ -37,20 +37,22 @@
 # if advised of the possibility of such damage.
 
 
+import sys
+import os
+import argparse
 import subprocess
 import re
 import time
 import datetime
-import os
+import threading
 import signal
-import argparse
 import warnings
 import shutil
 import shlex
 
 
-MONITOR_INTERVAL = 1  # seconds
-DOWN_LIMIT = datetime.timedelta(seconds=5)
+OUTPUT_PREFIX = os.path.basename(__file__).upper() if '__file__' in globals() \
+    else 'FDISTDUMP-HA'
 
 binaries = {
     'fdistdump': 'fdistdump',
@@ -62,8 +64,30 @@ binaries = {
 
 
 ###############################################################################
+# exceptions
+class Error(Exception):
+    """Base class for exceptions in this module."""
+    pass
+
+
+class GraphError(Error):
+    """Exception raised for errors in the graph.
+
+    Attributes:
+        message -- explanation of the error
+    """
+
+    def __init__(self, message):
+        self.message = message
+
+
+###############################################################################
+def myformatverbose(*args, **kwargs):
+    print(OUTPUT_PREFIX, 'VERBOSE:', *args, **kwargs)
+
+
 def myformatwarning(message, category, filename, lineno, line=None):
-    return 'Warning: {}\n'.format(str(message))
+    return '{} WARNING: {}\n'.format(OUTPUT_PREFIX, str(message))
 
 
 def get_nodes_names():
@@ -265,15 +289,14 @@ def graph_check_validity(nodes_dict):
     subcoll_set = get_subcollector_set(nodes_dict)
 
     if len(subcoll_set) == 0:
-        print('Error: empty subcollector set.')
-        return False
+        raise GraphError('empty subcollector set')
 
     first_id = node_id = subcoll_set.pop()
     succ_id = nodes_dict[node_id]['successor']
 
     if node_id == succ_id:
-        warnings.warn('self-loop doesn\'t make sense.')
-        return True
+        warnings.warn('self-loop doesn\'t make sense')
+        return
 
     while succ_id in subcoll_set:
         subcoll_set.remove(succ_id)
@@ -281,10 +304,7 @@ def graph_check_validity(nodes_dict):
         succ_id = nodes_dict[node_id]['successor']
 
     if succ_id != first_id or len(subcoll_set) != 0:
-        print('Error: invalid subcollector graph.')
-        return False
-    else:
-        return True
+        raise GraphError('invalid subcollector graph')
 
 
 def graph_print(nodes_dict):
@@ -362,13 +382,13 @@ def construct_hosts_and_paths(nodes_dict, setup_dict):
                     fdistdump_conv_spec + setup_dict['flow-backup-brick'],
                     sub_name)
                 paths.append(succ_path)
-                warn_msg += 'using successor {} ({}) as a backup.' \
+                warn_msg += 'using successor {} ({}) as a backup' \
                     .format(succ, succ_name)
                 warnings.warn(warn_msg)
             else:
                 # successor is offline, data set will be incomplete
                 warn_msg += 'its successor {} ({}) also isn\'t online. ' \
-                    'Data set for this job is incomplete!' \
+                    'Data set for this job is incomplete' \
                     .format(succ, succ_name)
                 warnings.warn(warn_msg)
 
@@ -379,39 +399,185 @@ def construct_hosts_and_paths(nodes_dict, setup_dict):
     return (slave_names, paths)
 
 
+def terminate_job(job_popen, timeout):
+    verbose_print('sending SIGTERM')
+    job_popen.terminate()
+    try:
+        job_popen.wait(timeout)
+    except subprocess.TimeoutExpired:
+        verbose_print('SIGTERM did not work. Sending SIGKILL')
+        job_popen.kill()
+        try:
+            job_popen.wait(timeout)
+        except subprocess.TimeoutExpired:
+            verbose_print('SIGKILL did not work, giving up')
+        else:
+            verbose_print('SIGKILL has terminated the job')
+    else:
+        verbose_print('SIGTERM has terminated the job')
+
+
 def signal_handler(signal, frame):
-    verbose_print('Received signal', signal)
-    # TODO: disable restart
+    """
+    When signal is sent to the process group (which is the same for the
+    fdistdump-ha and fdistdump), MPI process manager will terminate the job
+    in a usual way, but it can take a while (therefore the first wait).
 
-    if 'mpi_job_proc' not in globals() or mpi_job_proc is None:
-        warnings.warn('job has not been started yet.')
-        return
+    But when signal is sent only to the fdistdump-ha process or MPI process
+    manager for some reason couldn't terminate the job by itself, its our
+    responsibility to terminate the job -- first by SIGTERM, then by SIGKILL.
+    """
 
-    # When signal is sent to the process group (which is the same for the
-    # fdistdump-ha and fdistdump), MPI process manager will terminate the job
-    # in a usual way, but it can take a while (therefore the sleep()).
-    warnings.warn('waiting for job self-termination.')
-    for i in range(5):
-        time.sleep(1)
-        if mpi_job_proc.poll() is not None:
-            return
+    warnings.warn('received signal {}, terminating the job and exitting as '
+                  'soon as possible'.format(signal))
+    timeout = 5
 
-    # When signal is sent only to the fdistdump-ha process or MPI process
-    # manager for some reason couldn't terminate it by itself, its our
-    # responsibility to terminate the job.
-    warnings.warn('terminating job.')
-    mpi_job_proc.terminate()
-    mpi_job_proc.wait(5)
+    if ('mpi_job_proc' not in globals()
+            or mpi_job_proc is None
+            or mpi_job_proc.poll() is not None):
+        verbose_print('job is not running, exiting immediately')
+    else:
+        verbose_print('job is running, waiting {} seconds for job to '
+                      'self-terminate'.format(timeout))
+        try:
+            mpi_job_proc.wait(timeout)
+        except subprocess.TimeoutExpired:
+            verbose_print('job did not self-terminate')
+            terminate_job(mpi_job_proc, timeout)
+        else:
+            verbose_print('job has self-terminated')
+
+    sys.exit()  # only raises the SystemExit exception
 
 
-def run():
+class ClusterHealthMonitor:
+    """Cluster health monitoring class."""
+
+    def __init__(self, online_ref_set, nodes_dict):
+        self.state = self.State()
+        self.online_ref_set = online_ref_set
+        self.online_set = online_ref_set
+        self.nodes_dict = nodes_dict
+        self.termination_timer = threading.Timer(
+            args.termination_timeout.total_seconds(), self._terminate)
+        self.terminated = False
+
+    def __del(self):
+        self.termination_timer.cancel()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.termination_timer.cancel()
+
+    def _terminate(self):
+        warnings.warn('{}: time spent in the denied state exceeded its limit, '
+                      'terminating the job'.format(type(self).__name__))
+        terminate_job(mpi_job_proc, 5)
+        self.terminated = True
+
+    def update(self, online_set_new):
+            # compare the current online node set to the previous one
+            if online_set_new != self.online_set:
+                # one or more nodes went online, offline or combination
+                online_superset = online_set_new - self.online_set
+                offline_superset = self.online_set - online_set_new
+
+                for node in online_superset:
+                    warnings.warn(
+                        '{}: node {} has upgraded to the online status'
+                        .format(type(self).__name__,
+                                self.nodes_dict[node]['name']))
+                for node in offline_superset:
+                    warnings.warn(
+                        '{}: node {} has degraded from the online status'
+                        .format(type(self).__name__,
+                                self.nodes_dict[node]['name']))
+
+            # compare the current online node set to the reference one
+            online_superset = online_set_new - self.online_ref_set
+            offline_superset = self.online_ref_set - online_set_new
+            state_new = self.State(bool(online_superset),
+                                   bool(offline_superset))
+
+            # check if the state has changed
+            if self.state != state_new:
+                state_status = 'denied' if \
+                    self.state.is_denied(args.allowed_state) else 'allowed'
+                state_new_status = 'denied' if \
+                    state_new.is_denied(args.allowed_state) else 'allowed'
+
+                warnings.warn('{}: transition from the {} state <{}> to the '
+                              '{} state <{}>'.format(type(self).__name__,
+                                                     state_status, self.state,
+                                                     state_new_status,
+                                                     state_new))
+                if state_new.is_denied(args.allowed_state):
+                    # transition to the denied state, start the timer
+                    if not self.termination_timer.is_alive():
+                        self.termination_timer.start()
+                else:
+                    # transition to the allowed state, cancel the timer
+                    self.termination_timer.cancel()
+                    self.termination_timer = threading.Timer(
+                        args.termination_timeout.total_seconds(),
+                        self._terminate)
+
+            self.state.update(state_new)
+            self.online_set = online_set_new
+
+    class State:
+        """Class representing state of the ClusterHealthMonitor."""
+
+        def __init__(self, online=False, offline=False):
+            self._online = bool(online)
+            self._offline = bool(offline)
+
+        def __eq__(self, other):
+            return (self._online == other._online
+                    and self._offline == other._offline)
+
+        def __or__(self, other):
+            return (self._online == other._online
+                    or self._offline == other._offline)
+
+        def __str__(self):
+            if self._online and self._offline:
+                return 'superset of both online and offline nodes'
+            elif self._online:
+                return 'superset of online nodes'
+            elif self._offline:
+                return 'superset of offline nodes'
+            else:
+                return 'reference'
+
+        def update(self, other):
+            self._online = other._online
+            self._offline = other._offline
+
+        def is_denied(self, other):
+            return (self._online and not other._online
+                    or self._offline and not other._offline)
+
+    class ClusterHealthMonitorError(Error):
+        """General ClusterHealthMonitor exception.
+
+        Attributes:
+            message -- explanation of the error
+        """
+
+        def __init__(self, message):
+            self.message = message
+
+
+def run_job():
     # load current cluster and nodes setup
     setup_dict = load_setup_dict()
     nodes_dict = load_nodes_dict()
 
     # check the topology graph validity
-    if not graph_check_validity(nodes_dict):
-        return 1
+    graph_check_validity(nodes_dict)
 
     # construct hosts and appropriate paths based on the current cluster status
     hosts, base_paths = construct_hosts_and_paths(nodes_dict, setup_dict)
@@ -424,77 +590,47 @@ def run():
     # get reference set of online nodes and run the job
     subprocess_args = (mpi_args + [mpi_hosts] + priority_args + fdistdump_args
                        + fdistdump_paths)
-    verbose_print("launching command:", ' '.join([shlex.quote(arg)
+    verbose_print('launching command:', ' '.join([shlex.quote(arg)
                   for arg in subprocess_args]))
-    online_ref_set = get_online_set()
     global mpi_job_proc
     mpi_job_proc = subprocess.Popen(subprocess_args)
 
     # start monitoring loop
-    state_cur = 'reference'
-    online_cur_set = online_ref_set
-    node_down_for = 0  # seconds
-    while mpi_job_proc.poll() is None:
-        online_prev_set = online_cur_set
-        online_cur_set = get_online_set()
-        cur_ts = datetime.datetime.now()
-
-        if state_cur != 'reference':
-            ts_delta = cur_ts - transition_ts
-            if ts_delta >= DOWN_LIMIT:
-                warnings.warn('no-in-referece-state time limit exceeded, '
-                              'terminating job.')
-                mpi_job_proc.terminate()
-                mpi_job_proc.wait(5)
-                break
-
-        # compare current state to the previous state
-        if online_cur_set != online_prev_set:
-            # one or more nodes went online, offline or combination
-            online_superset = online_cur_set - online_prev_set
-            offline_superset = online_prev_set - online_cur_set
-
-            for node in online_superset:
-                warnings.warn('node {} has upgraded to online state.'
-                              .format(nodes_dict[node]['name']))
-            for node in offline_superset:
-                warnings.warn('node {} has degraded from online state.'
-                              .format(nodes_dict[node]['name']))
-
-        # compare current state to the reference state
-        if online_cur_set != online_ref_set:
-            # one or more nodes is online, offline or combination
-            online_superset = online_cur_set - online_ref_set
-            offline_superset = online_ref_set - online_cur_set
-
-            # FSM transition
-            if online_superset:
-                state_new = 'online superset'
-            elif offline_superset:
-                state_new = 'offline superset'
-            elif online_superset and offline_superset:
-                state_new = 'mixed'
+    with ClusterHealthMonitor(get_online_set(), nodes_dict) as chm:
+        while mpi_job_proc.poll() is None:
+            chm.update(get_online_set())
+            time.sleep(args.health_monitoring_interval.total_seconds())
         else:
-            state_new = 'reference'
+            if chm.terminated:
+                raise ClusterHealthMonitor.ClusterHealthMonitorError(
+                    'job terminated by the ClusterHealthMonitor')
 
-        if state_cur != state_new:
-            if state_cur == 'reference':
-                transition_ts = datetime.datetime.now()
+    # process has finished
+    return mpi_job_proc.returncode
 
-            warnings.warn('monitoring FSM going from "{}" state to the "{}" '
-                          'state.'.format(state_cur, state_new))
-            state_cur = state_new
 
-        time.sleep(MONITOR_INTERVAL)
+def argument_type_positive_int(value_str):
+    try:
+        value_int = int(value_str)
+    except:
+        exc_msg = sys.exc_info()[1]
+        raise argparse.ArgumentTypeError(exc_msg)
 
-    # process finished
-    if mpi_job_proc.returncode != 0:
-        warnings.warn('MPI process manager returned non-zero exit code {}.'
-                      .format(mpi_job_proc.returncode))
+    if value_int < 0:
+        raise argparse.ArgumentTypeError('negative value is not allowed')
+    else:
+        return value_int
 
-    rc = mpi_job_proc.returncode
-    mpi_job_proc = None
-    return rc
+
+def argument_type_timedelta(seconds_str):
+    seconds_int = argument_type_positive_int(seconds_str)
+    try:
+        delta = datetime.timedelta(seconds=seconds_int)
+    except:
+        exc_msg = sys.exc_info()[1]
+        raise argparse.ArgumentTypeError(exc_msg)
+
+    return delta
 
 ###############################################################################
 if __name__ == "__main__":
@@ -520,22 +656,76 @@ if __name__ == "__main__":
     ########################################
     # process command line arguments
     # set and parse
-    parser = argparse.ArgumentParser(description='fdistdump(1) wrapper with '
-                                     'support for high-availability using '
-                                     'Corosync/Pacemaker stack.')
-    parser.add_argument('-m', '--mpi-args', dest='user_mpi_args',
+    parser = argparse.ArgumentParser(
+        description='fdistdump(1) wrapper with support for high-availability '
+        'using Corosync/Pacemaker stack.')
+
+    parser.add_argument('-m', '--mpi-args',
+                        dest='user_mpi_args',
                         help='Arguments passed to the mpiexec(1) command.')
-    parser.add_argument('-f', '--fdistdump-args', dest='user_fdistdump_args',
+    parser.add_argument('-f', '--fdistdump-args',
+                        dest='user_fdistdump_args',
                         help='Arguments passed to the fdistdump(1) command.')
 
-    parser.add_argument('-p', '--priority', dest='priority', choices=['low',
-                        'normal', 'high'], help='Run fdistdump with adjusted '
+    parser.add_argument('-a', '--allowed-cluster-state',
+                        dest='allowed_state',
+                        nargs='+',
+                        choices=['online', 'offline'],
+                        help='Allow the job to continue even if the '
+                        'ClusterHealthMonitor enter the specified state(s). '
+                        'States are relative to the reference state '
+                        '(the state of the cluster during the job startup). '
+                        'Reference state is always allowed.'
+                        '"online" means continue even if the set of online '
+                        'nodes is a superset of the refernece online nodes '
+                        'set (e.g. one or more nodes went online during the '
+                        'job), '
+                        '"offline" means continue even if the set of '
+                        'offline nodes is a superset of the reference offline '
+                        'nodes set (e.g. one or more nodes went offline '
+                        'during the job).')
+    parser.add_argument('-i', '--health-monitoring-interval',
+                        dest='health_monitoring_interval',
+                        type=argument_type_timedelta,
+                        default=datetime.timedelta(seconds=1),
+                        help='Check changes in the health of the cluster '
+                        'every HEALTH-MONITORING-INTERVAL seconds. '
+                        'The defaults is 1 second.')
+    parser.add_argument('-e', '--termination-timeout',
+                        dest='termination_timeout',
+                        type=argument_type_timedelta,
+                        default=datetime.timedelta(seconds=10),
+                        help='Terminate the job after specified amount of '
+                        'seconds spent in one of denied states. '
+                        'The default is 10 seconds.')
+    parser.add_argument('-t', '--tries',
+                        dest='tries',
+                        type=argument_type_positive_int,
+                        default=1,
+                        help='After the job is terminated because the cluster '
+                        'was in one of the denied states for more than '
+                        'TERMINATION-TIMEOUT seconds (see the '
+                        '--allowed-cluster-state and --termination-timeout '
+                        'options), it can be automatically restarted with '
+                        'updated refernece state according to the current '
+                        'situation. This option sets number of tries before '
+                        'giving up. Specify 0 for ' 'infinite retrying. '
+                        'The default is 1 try.')
+
+    parser.add_argument('-p', '--priority',
+                        dest='priority',
+                        choices=['low', 'normal', 'high'],
+                        help='Run fdistdump with adjusted '
                         'niceness and I/O scheduling class. For more '
                         'information see nice(1) and ionice(1).')
-    parser.add_argument('-v', '--verbose', dest='verbose', action='store_true',
+    parser.add_argument('-v', '--verbose',
+                        dest='verbose',
+                        action='store_true',
                         help='Be verbose.')
 
-    parser.add_argument('path', nargs='+', help='Path to your flow '
+    parser.add_argument('path',
+                        nargs='+',
+                        help='Path to your flow '
                         'file/directory relative to the "flow-primary-brick" '
                         'Pacemaker property, e.g. path will be "2016/07/" if '
                         'you want to process all flow files from July 2016.')
@@ -545,7 +735,7 @@ if __name__ == "__main__":
     user_paths = []
     for path in args.path:
         if path[0] == '/':
-            warnings.warn('skipping absolute path "{}".'.format(path))
+            warnings.warn('skipping absolute path "{}"'.format(path))
         else:
             user_paths.append(path)
     if len(user_paths) == 0:
@@ -569,10 +759,54 @@ if __name__ == "__main__":
     if args.user_mpi_args:
         mpi_args += shlex.split(args.user_mpi_args)
 
+    # handle restarts
+    DOWN_LIMIT = datetime.timedelta(seconds=5)
+
     # define verbose print function
-    verbose_print = print if args.verbose else lambda *a, **k: None
+    verbose_print = myformatverbose if args.verbose else lambda *a, **k: None
+
+    # handle denied states
+    if args.allowed_state:
+        args.allowed_state = ClusterHealthMonitor.State(
+            'online' in args.allowed_state, 'offline' in args.allowed_state)
+    else:
+        args.allowed_state = ClusterHealthMonitor.State()
 
     ########################################
     mpi_job_proc = None  # make the subprocess object global for signal handler
-    rc = run()
-    exit(rc)
+    tries = 0
+    while True:
+        tries += 1
+        if args.tries == 0:
+            verbose_print('try {}'.format(tries))
+        elif tries <= args.tries:
+            verbose_print('try {}/{}'.format(tries, args.tries))
+        else:
+            warnings.warn('no more tries, giving up')
+            rc = None
+            break
+
+        try:
+            rc = run_job()
+        except ClusterHealthMonitor.ClusterHealthMonitorError:
+            # cluster failure, try again with new cluster configuration
+            continue
+        else:
+            # job success of failure, don't try again
+            verbose_print('job exit code = {}'.format(rc))
+            if rc < 0:
+                warnings.warn('job was terminated by a signal')
+            elif rc > 0:
+                warnings.warn('job terminated with non-zero exit code', rc)
+            break
+        finally:
+            if mpi_job_proc is not None and mpi_job_proc.poll() is None:
+                warnings.warn('job should not be running now, but it is. '
+                              'Terminating')
+                terminate_job(mpi_job_proc, 5)
+
+    ########################################
+    if rc is None:
+        exit(-1)
+    else:
+        exit(rc)
