@@ -230,7 +230,7 @@ check_args() {
         else
                 # running over SSH, check internal commands
                 case "${ARG_COMMANDS[0]}" in
-                check_network|check_programs|check_libraries) ;;
+                check_network|check_programs|check_libraries|check_vip) ;;
                 gluster1_all|gluster2_one|gluster3_all) ;;
                 ipfixcol1_all|ipfixcol2_one) ;;
                 fdistdump1_all) ;;
@@ -252,18 +252,20 @@ parse_config() {
 
                 case "$KEY" in
                 # definition of nodes
-                "node_proxy") PRO_NODES[${#PRO_NODES[@]}]="${VALUE}" ;;
-                "node_subcollector") SUB_NODES[${#SUB_NODES[@]}]="${VALUE}" ;;
+                "node_proxy") PRO_NODES[${#PRO_NODES[@]}]="$VALUE" ;;
+                "node_subcollector") SUB_NODES[${#SUB_NODES[@]}]="$VALUE" ;;
 
                 # GlusterFS options
                 "gfs_conf_brick") GFS_CONF_BRICK="${VALUE}" ;;
-                "gfs_flow_primary_brick") GFS_FLOW_PRIMARY_BRICK="${VALUE}" ;;
-                "gfs_flow_backup_brick") GFS_FLOW_BACKUP_BRICK="${VALUE}" ;;
-                "gfs_conf_mount") GFS_CONF_MOUNT="${VALUE}" ;;
-                "gfs_flow_mount") GFS_FLOW_MOUNT="${VALUE}" ;;
+                "gfs_flow_primary_brick") GFS_FLOW_PRIMARY_BRICK="$VALUE" ;;
+                "gfs_flow_backup_brick") GFS_FLOW_BACKUP_BRICK="$VALUE" ;;
+                "gfs_conf_mount") GFS_CONF_MOUNT="$VALUE" ;;
+                "gfs_flow_mount") GFS_FLOW_MOUNT="$VALUE" ;;
 
-                # other options
-                "virtual_ip") VIRTUAL_IP="${VALUE}" ;;
+                # virtual (floating) IP address options
+                "vip_address") VIP_ADDRESS="$VALUE" ;;
+                "vip_prefix") VIP_PREFIX="$VALUE" ;;
+                "vip_interface") VIP_INTERFACE="$VALUE" ;;
                 esac
         done < <(grep "^[^=]*=" "$1")  # process substitution magic
 
@@ -303,16 +305,19 @@ check_config() {
                 return 1
         fi
 
-        #check other options
-        if [ -z "$VIRTUAL_IP" ]; then
-                error "configuration: missing mandatory key \"virtual_ip\""
+        # syntactically check virtual (floating) IP address options
+        if [ -z "$VIP_ADDRESS" ]; then
+                error "configuration: missing mandatory key \"vip_address\""
                 return 1
-        elif type ipcalc >/dev/null 2>&1; then
-                # we have ipcalc, check supplied IPv4 validity
-                if ! ipcalc -sc4 "$VIRTUAL_IP"; then
-                        error "configuration: virtual_ip: invalid IPv4 address \"$VIRTUAL_IP\""
-                        return 1
-                fi
+        elif type ipcalc &>/dev/null && ! ipcalc -sc4 "$VIP_ADDRESS"; then
+                error "configuration: vip_address: invalid IPv4 address \"$VIP_ADDRESS\""
+                return 1
+        fi
+        if [[ -n "$VIP_PREFIX" && ! ( "$VIP_PREFIX" =~ ^-?[0-9]+$ && \
+                "$VIP_PREFIX" -ge 0 && "$VIP_PREFIX" -le 32 ) ]]
+        then
+                error "configuration: vip_prefix: invalid prefix \"$VIP_PREFIX\""
+                return 1
         fi
 
         return 0
@@ -347,6 +352,7 @@ check() {
         ssh_exec check_network "${ALL_NODES[@]}"
         ssh_exec check_programs "${ALL_NODES[@]}"
         ssh_exec check_libraries "${ALL_NODES[@]}"
+        ssh_exec check_vip "${ALL_NODES[@]}"
 }
 
 check_network() {
@@ -419,6 +425,16 @@ check_libraries() {
                         return 1
                 fi
         done
+}
+
+check_vip() {
+        # semantically check virtual (floating) IP address options
+        if [ -n "$VIP_INTERFACE" ] && \
+                ! ip link show "$VIP_INTERFACE" >/dev/null
+        then
+                error "interface \"$VIP_INTERFACE\" does not exist"
+                return 1
+        fi
 }
 
 
@@ -769,8 +785,8 @@ stack2_one() {
         # flow-backup-brick: store info about GlusterFS for fdistdump-ha
         declare -ar PROPERTIES=(
                 "stonith-enabled=false"
-                "flow-primary-brick=${GFS_FLOW_PRIMARY_BRICK}"
-                "flow-backup-brick=${GFS_FLOW_BACKUP_BRICK}"
+                "flow-primary-brick=$GFS_FLOW_PRIMARY_BRICK"
+                "flow-backup-brick=$GFS_FLOW_BACKUP_BRICK"
                 )
         local PROP
         for PROP in "${PROPERTIES[@]}"; do
@@ -787,7 +803,7 @@ stack2_one() {
 
         # create and clone resource for mounting gluster volume "conf"
         pcs_resource_create "gluster-conf-mount" "ocf:heartbeat:Filesystem" \
-                "device=localhost:/conf" "directory=${GFS_CONF_MOUNT}" \
+                "device=localhost:/conf" "directory=$GFS_CONF_MOUNT" \
                 "fstype=glusterfs" \
                 op \
                 start "timeout=60" \
@@ -798,7 +814,7 @@ stack2_one() {
 
         # create and clone resource for mounting gluster volume "flow"
         pcs_resource_create "gluster-flow-mount" "ocf:heartbeat:Filesystem" \
-                "device=localhost:/flow" "directory=${GFS_FLOW_MOUNT}" \
+                "device=localhost:/flow" "directory=$GFS_FLOW_MOUNT" \
                 "fstype=glusterfs" \
                 op \
                 start "timeout=60" \
@@ -810,7 +826,7 @@ stack2_one() {
         # create and clone resource for IPFIXcol in role proxy
         pcs_resource_create "ipfixcol-proxy" "ocf:cesnet:ipfixcol.sh" \
                 "role=proxy" "verbosity=1" \
-                "startup_conf=${GFS_CONF_MOUNT}/ipfixcol/startup-proxy.xml" \
+                "startup_conf=$GFS_CONF_MOUNT/ipfixcol/startup-proxy.xml" \
                 op \
                 monitor "interval=20" \
                 meta "migration-threshold=1" "failure-timeout=600"
@@ -819,14 +835,15 @@ stack2_one() {
         # create and clone resource for IPFIXcol in role subcollector
         pcs_resource_create "ipfixcol-subcollector" "ocf:cesnet:ipfixcol.sh" \
                 "role=subcollector" "verbosity=1" \
-                "startup_conf=${GFS_CONF_MOUNT}/ipfixcol/startup-subcollector.xml" \
+                "startup_conf=$GFS_CONF_MOUNT/ipfixcol/startup-subcollector.xml" \
                 op \
                 monitor "interval=20"
         pcs_resource_clone "ipfixcol-subcollector" "interleave=true"
 
         # create a resource for virtual IP address
         pcs_resource_create "virtual-ip" "ocf:heartbeat:IPaddr2" \
-                "ip=${VIRTUAL_IP}" \
+                "ip=$VIP_ADDRESS" "cidr_netmask=$VIP_PREFIX" \
+                "nic=$VIP_INTERFACE" \
                 op \
                 monitor "interval=20" \
                 meta "resource-stickiness=1"
