@@ -163,12 +163,12 @@ error() {
 
 str_strip() {
         # Return a copy of the string (first argument) with the leading and
-        # trailing characters removed. The chars (second argument) is a string
-        # specifying the set of characters to be removed. If omitted, the chars
-        # argument defaults to removing whitespace ([:space:]). The chars
-        # argument is not a prefix or suffix; rather, all combinations of its
-        # values are stripped. It can be any combination of characters or
-        # character classes accepter by sed's bracket expression.
+        # trailing characters removed. The optional second argument is a set of
+        # characters to be removed. If omitted, it defaults to removing
+        # whitespace ([:space:]). The second argument is not a prefix or suffix;
+        # rather, all combinations of its values are stripped. It can be any
+        # combination of characters or character classes accepter by sed's
+        # bracket expression.
 
         if [ "$#" -eq 0 ]; then
                 return
@@ -178,7 +178,35 @@ str_strip() {
                 CHAR_SET="$2"
         fi
 
-        echo "$1" | sed -e "s/^[${CHAR_SET}]*//" -e "s/[${CHAR_SET}]*$//"
+        sed -e "s/^[${CHAR_SET}]*//" -e "s/[${CHAR_SET}]*$//" <<<"$1"
+}
+
+str_lstrip() {
+        # Like str_strip, except that only the leading characters are removed.
+
+        if [ "$#" -eq 0 ]; then
+                return
+        elif [ "$#" -eq 1 ]; then
+                CHAR_SET="[:space:]"
+        else
+                CHAR_SET="$2"
+        fi
+
+        sed -e "s/^[${CHAR_SET}]*//" <<<"$1"
+}
+
+str_rstrip() {
+        # Like str_strip, except that only the trailing characters are removed.
+
+        if [ "$#" -eq 0 ]; then
+                return
+        elif [ "$#" -eq 1 ]; then
+                CHAR_SET="[:space:]"
+        else
+                CHAR_SET="$2"
+        fi
+
+        sed -e "s/[${CHAR_SET}]*$//" <<<"$1"
 }
 
 parse_args() {
@@ -255,12 +283,17 @@ parse_config() {
                 "node_proxy") PRO_NODES[${#PRO_NODES[@]}]="$VALUE" ;;
                 "node_subcollector") SUB_NODES[${#SUB_NODES[@]}]="$VALUE" ;;
 
-                # GlusterFS options
-                "gfs_conf_brick") GFS_CONF_BRICK="${VALUE}" ;;
-                "gfs_flow_primary_brick") GFS_FLOW_PRIMARY_BRICK="$VALUE" ;;
-                "gfs_flow_backup_brick") GFS_FLOW_BACKUP_BRICK="$VALUE" ;;
-                "gfs_conf_mount") GFS_CONF_MOUNT="$VALUE" ;;
-                "gfs_flow_mount") GFS_FLOW_MOUNT="$VALUE" ;;
+                # GlusterFS options (paths)
+                "gfs_conf_brick")
+                        GFS_CONF_BRICK="$(str_rstrip "$VALUE" "/")" ;;
+                "gfs_flow_primary_brick")
+                        GFS_FLOW_PRIMARY_BRICK="$(str_rstrip "$VALUE" "/")" ;;
+                "gfs_flow_backup_brick")
+                        GFS_FLOW_BACKUP_BRICK="$(str_rstrip "$VALUE" "/")" ;;
+                "gfs_conf_mount")
+                        GFS_CONF_MOUNT="$(str_rstrip "$VALUE" "/")" ;;
+                "gfs_flow_mount")
+                        GFS_FLOW_MOUNT="$(str_rstrip "$VALUE" "/")" ;;
 
                 # virtual (floating) IP address options
                 "vip_address") VIP_ADDRESS="$VALUE" ;;
@@ -366,7 +399,7 @@ check_network() {
                 fi
                 local LINE
                 while read LINE; do
-                        local ADDR=$(echo "$LINE" | cut -d" " -f 1)
+                        local ADDR=$(cut -d" " -f 1 <<<"$LINE")
                         if [[ "$ADDR" == 127.* || "$ADDR" == ::1* ]]; then
                                 error "$NODE is mapped to localhost IP address \"$ADDR\""
                                 return 1
@@ -592,7 +625,7 @@ ipfixcol1_all() {
         declare -r GITHUB_URL="${GITHUB_BASE_URL}/ipfixcol/ocf/"
         declare -r RA_PATH="/usr/lib/ocf/resource.d/"
         declare -r RA_PROVIDER="cesnet"
-        declare -r RA_NAME="ipfixcol.sh"
+        declare -r RA_NAME="ipfixcol"
 
         # download and install OCF resource agent
         mkdir -p "${RA_PATH}/${RA_PROVIDER}/"
@@ -600,9 +633,6 @@ ipfixcol1_all() {
         echo "Downloading OCF resource agent"
         curl -sS "${GITHUB_URL}/${RA_NAME}" \
                 >"${RA_PATH}/${RA_PROVIDER}/${RA_NAME}"
-        curl -sS "${GITHUB_URL}/ipfixcol.metadata" \
-                >"${RA_PATH}/${RA_PROVIDER}/ipfixcol.metadata"
-
         chmod +x "${RA_PATH}/${RA_PROVIDER}/${RA_NAME}"
 }
 
@@ -680,8 +710,6 @@ END
                                 <fileFormat>lnfstore</fileFormat>
                                 <profiles>no</profiles>
                                 <storagePath>${GFS_FLOW_MOUNT}/%h/</storagePath>
-                                <prefix>nfcapd.</prefix>
-                                <suffixMask>%Y%m%d%H%M%S</suffixMask>
                                 <identificatorField>securitycloud</identificatorField>
                                 <compress>yes</compress>
                                 <dumpInterval>
@@ -845,8 +873,8 @@ stack2_one() {
         # http://lists.clusterlabs.org/pipermail/users/2017-April/005560.html
 
         # create a primitive resource for IPFIXcol in a proxy role
-        pcs_resource_create "ipfixcol-proxy" "ocf:cesnet:ipfixcol.sh" \
-                "role=proxy" "verbosity=1" \
+        pcs_resource_create "ipfixcol-proxy" "ocf:cesnet:ipfixcol" \
+                "role=proxy" \
                 "startup_conf=$GFS_CONF_MOUNT/ipfixcol/startup-proxy.xml" \
                 op \
                 monitor "interval=20" \
@@ -864,8 +892,8 @@ stack2_one() {
 
         # IPFIXcol subcollector ################################################
         # create a primitive resource for IPFIXcol in a subcollector role
-        pcs_resource_create "ipfixcol-subcollector" "ocf:cesnet:ipfixcol.sh" \
-                "role=subcollector" "verbosity=1" \
+        pcs_resource_create "ipfixcol-subcollector" "ocf:cesnet:ipfixcol" \
+                "role=subcollector" \
                 "startup_conf=$GFS_CONF_MOUNT/ipfixcol/startup-subcollector.xml" \
                 op \
                 monitor "interval=20"
