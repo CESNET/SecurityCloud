@@ -794,14 +794,18 @@ stack2_one() {
                 crm_attribute  --name="${PROP%%=*}" --update="${PROP#*=}"
         done
 
-        # resources ############################################################
-        # create and clone resource for managing gluster daemon
+
+        # gluster deamon #######################################################
+        # create a primitive resource for managing gluster daemon
         pcs_resource_create "gluster-daemon" "ocf:glusterfs:glusterd" \
                 op \
                 monitor "interval=20s"
+        # create a clone with instance on every node
         pcs_resource_clone  "gluster-daemon" "interleave=true"
 
-        # create and clone resource for mounting gluster volume "conf"
+
+        # gluster conf #########################################################
+        # create a primitive resource for mounting gluster volume "conf"
         pcs_resource_create "gluster-conf-mount" "ocf:heartbeat:Filesystem" \
                 "device=localhost:/conf" "directory=$GFS_CONF_MOUNT" \
                 "fstype=glusterfs" \
@@ -809,10 +813,16 @@ stack2_one() {
                 start "timeout=60" \
                 stop "timeout=60" \
                 monitor "interval=20" "OCF_CHECK_LEVEL=0" \
-                monitor "interval=60" "OCF_CHECK_LEVEL=20"
+                monitor "interval=60" "timeout=60" "OCF_CHECK_LEVEL=20"
+        # create a clone with instance on every node
         pcs_resource_clone "gluster-conf-mount" "interleave=true"
+        # make sure gluster daemon is started during startup and when running
+        pcs_constraint_order "gluster-daemon-clone" "gluster-conf-mount-clone" \
+                "mandatory"
 
-        # create and clone resource for mounting gluster volume "flow"
+
+        # gluster flow #########################################################
+        # create a primitive resource for mounting gluster volume "flow"
         pcs_resource_create "gluster-flow-mount" "ocf:heartbeat:Filesystem" \
                 "device=localhost:/flow" "directory=$GFS_FLOW_MOUNT" \
                 "fstype=glusterfs" \
@@ -820,70 +830,71 @@ stack2_one() {
                 start "timeout=60" \
                 stop "timeout=60" \
                 monitor "interval=20" "OCF_CHECK_LEVEL=0" \
-                monitor "interval=60" "OCF_CHECK_LEVEL=20"
+                monitor "interval=60" "timeout=60" "OCF_CHECK_LEVEL=20"
+        # create a clone with instance on every node
         pcs_resource_clone "gluster-flow-mount" "interleave=true"
+        # make sure gluster daemon is started during startup and when running
+        pcs_constraint_order "gluster-daemon-clone" "gluster-flow-mount-clone" \
+                "mandatory"
 
-        # create and clone resource for IPFIXcol in role proxy
+
+        # IPFIXcol proxy #######################################################
+        # NOTE: if we would create a clone with instance on utmost two nodes
+        # (clone-max=2) we would save some resources, but we would run
+        # into problem described here:
+        # http://lists.clusterlabs.org/pipermail/users/2017-April/005560.html
+
+        # create a primitive resource for IPFIXcol in a proxy role
         pcs_resource_create "ipfixcol-proxy" "ocf:cesnet:ipfixcol.sh" \
                 "role=proxy" "verbosity=1" \
                 "startup_conf=$GFS_CONF_MOUNT/ipfixcol/startup-proxy.xml" \
                 op \
                 monitor "interval=20" \
                 meta "migration-threshold=1" "failure-timeout=600"
-        pcs_resource_clone "ipfixcol-proxy" "clone-max=2" "interleave=true"
+        # create a clone with instance on utmost two nodes
+        pcs_resource_clone "ipfixcol-proxy" "interleave=true"
+        # make sure gluster conf volume is mounted during startup
+        pcs_constraint_order "gluster-conf-mount-clone" "ipfixcol-proxy-clone" \
+                "optional"
+        # prefer to run on dedicated proxy nodes (nodes without defined
+        # "successor" property)
+        pcs_constraint_location "ipfixcol-proxy-clone" \
+                100 not_defined "successor"
 
-        # create and clone resource for IPFIXcol in role subcollector
+
+        # IPFIXcol subcollector ################################################
+        # create a primitive resource for IPFIXcol in a subcollector role
         pcs_resource_create "ipfixcol-subcollector" "ocf:cesnet:ipfixcol.sh" \
                 "role=subcollector" "verbosity=1" \
                 "startup_conf=$GFS_CONF_MOUNT/ipfixcol/startup-subcollector.xml" \
                 op \
                 monitor "interval=20"
+        # create a clone with instance on every node
         pcs_resource_clone "ipfixcol-subcollector" "interleave=true"
+        # make sure gluster conf volume is mounted during startup
+        pcs_constraint_order "gluster-conf-mount-clone" \
+                "ipfixcol-subcollector-clone" "optional"
+        # make sure gluster flow volume is mounted during startup and when
+        # running
+        pcs_constraint_order "gluster-flow-mount-clone" \
+                "ipfixcol-subcollector-clone" "mandatory"
+        # never run on dedicated proxy nodes (nodes without defined "successor"
+        # property)
+        pcs_constraint_location "ipfixcol-subcollector-clone" \
+                "-INFINITY" not_defined "successor"
 
-        # create a resource for virtual IP address
+
+        # virtual (floating) IP address ########################################
+        # create a primitive resource
         pcs_resource_create "virtual-ip" "ocf:heartbeat:IPaddr2" \
                 "ip=$VIP_ADDRESS" "cidr_netmask=$VIP_PREFIX" \
                 "nic=$VIP_INTERFACE" \
                 op \
                 monitor "interval=20" \
                 meta "resource-stickiness=1"
-
-        # location constraints #################################################
-        # IPFIXcol subcollector cannot run on dedicated proxy nodes (nodes
-        # without defined "successor" property)
-        pcs_constraint_location "ipfixcol-subcollector-clone" \
-                "-INFINITY" not_defined "successor"
-        # IPFIXcol proxy prefers dedicated proxy nodes (nodes without defined
-        # "successor" property)
-        pcs_constraint_location "ipfixcol-proxy-clone" \
-                "100" not_defined "successor"
-
-        # order constraints ####################################################
-        # start gluster daemon clone before gluster conf can be mounted
-        # (interleaved)
-        pcs_constraint_order "gluster-daemon-clone" "gluster-conf-mount-clone" \
-                "mandatory"
-        # start gluster daemon clone before gluster flow can be mounted
-        # (interleaved)
-        pcs_constraint_order "gluster-daemon-clone" "gluster-flow-mount-clone" \
-                "mandatory"
-
-        # mount gluster conf volume before IPFIXcol proxy (optional,
-        # interleaved)
-        pcs_constraint_order "gluster-conf-mount-clone" "ipfixcol-proxy-clone" \
-                "optional"
-
-        # mount gluster conf volume before IPFIXcol subcollector (optional,
-        # interleaved)
-        pcs_constraint_order "gluster-conf-mount-clone" \
-                "ipfixcol-subcollector-clone" "optional"
-        # mount gluster flow volume before IPFIXcol subcollector (interleaved)
-        pcs_constraint_order "gluster-flow-mount-clone" \
-                "ipfixcol-subcollector-clone" "mandatory"
-
-        # colocation constraints ###############################################
-        # virtual IP
-        pcs_constraint_colocation "virtual-ip" "ipfixcol-proxy-clone" "INFINITY"
+        # make sure virtual IP runs on the same node where the cluster has
+        # determined IPFIXcol proxy should run
+        pcs_constraint_colocation "virtual-ip" "ipfixcol-proxy-clone" 1000
 }
 
 pcs_resource_create() {
@@ -950,6 +961,14 @@ pcs_constraint_order() {
 pcs_constraint_colocation() {
         # pcs constraint colocation add <source resource id> with
         #       <target resource id> [score] [options] [id=constraint-id]
+        #
+        # Request RES_ID_SRC to run on the same node where pacemaker has
+        # determined RES_ID_DST should run.
+        # Include RES_ID_SRC's preferences when deciding where to put
+        # RES_ID_DST.
+        # If RES_ID_DST cannot run anywhere, RES_ID_SRC can't run either.
+        # If RES_ID_SRC cannot run anywhere, RES_ID_DST will be unaffected.
+
         declare -r RES_ID_SRC="$1"
         declare -r RES_ID_DST="$2"
         declare -r SCORE="$3"
