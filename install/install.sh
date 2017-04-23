@@ -867,11 +867,6 @@ stack2_one() {
 
 
         # IPFIXcol proxy #######################################################
-        # NOTE: if we would create a clone with instance on utmost two nodes
-        # (clone-max=2) we would save some resources, but we would run
-        # into problem described here:
-        # http://lists.clusterlabs.org/pipermail/users/2017-April/005560.html
-
         # create a primitive resource for IPFIXcol in a proxy role
         pcs_resource_create "ipfixcol-proxy" "ocf:cesnet:ipfixcol" \
                 "role=proxy" \
@@ -880,7 +875,7 @@ stack2_one() {
                 monitor "interval=20" \
                 meta "migration-threshold=1" "failure-timeout=600"
         # create a clone with instance on utmost two nodes
-        pcs_resource_clone "ipfixcol-proxy" "interleave=true"
+        pcs_resource_clone "ipfixcol-proxy" "interleave=true" "clone-max=2"
         # make sure gluster conf volume is mounted during startup
         pcs_constraint_order "gluster-conf-mount-clone" "ipfixcol-proxy-clone" \
                 "optional"
@@ -919,10 +914,17 @@ stack2_one() {
                 "nic=$VIP_INTERFACE" \
                 op \
                 monitor "interval=20" \
-                meta "resource-stickiness=1"
-        # make sure virtual IP runs on the same node where the cluster has
-        # determined IPFIXcol proxy should run
-        pcs_constraint_colocation "virtual-ip" "ipfixcol-proxy-clone" 1000
+                meta "resource-stickiness=25"
+        # prefer to run on dedicated proxy nodes (nodes without defined
+        # "successor" property)
+        pcs_constraint_location "virtual-ip" 100 not_defined "successor"
+        # prefer to run on a node with highest IPFIXcol proxy etime (elapsed
+        # time since the process was started) because of IPFIX templates.
+        # Transient node attribute "ipfixcol_proxy_etime" is managed by the
+        # ipfixcol resource agent.
+        pcs constraint location "virtual-ip" rule \
+                "score-attribute=ipfixcol_proxy_etime" \
+                defined "ipfixcol_proxy_etime"
 }
 
 pcs_resource_create() {

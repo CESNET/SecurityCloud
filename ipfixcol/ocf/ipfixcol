@@ -57,9 +57,42 @@
 #       OCF_RESKEY_verbosity
 #       OCF_RESKEY_additional_args
 
+
+################################################################################
+# update transient attribute on exit
+transient_update() {
+        local NAME="ipfixcol_${OCF_RESKEY_role}_etime"
+        local ETIME_MAX=1000
+        local ACTION
+
+        if [ -f "$PIDFILE" ]; then
+                # pidfile exists
+                ACTION="update"
+                local PID="$(head -1 "$PIDFILE")"
+                # ETIME is elapsed time since the main process was started, in seconds
+                local ETIME="$(ps -p "$PID" -o etimes= | tr -d "[[:space:]]")"
+
+                # force upper limit to ETIME_MAX
+                if [ "$ETIME" -gt "$ETIME_MAX" ]; then
+                        ETIME="$ETIME_MAX"
+                fi
+        else
+                # pidfile does not exist
+                ACTION="delete"
+        fi
+
+        if attrd_updater --name $NAME --$ACTION $ETIME; then
+                ocf_log debug "${LOG_PREFIX}successfully ${ACTION}d transient attribute \"$NAME\" to \"$ETIME\""
+        else
+                ERR="failed to $ACTION transient attribute \"$NAME\""
+                ocf_log err "${LOG_PREFIX}${ERR}"
+        fi
+}
+trap transient_update EXIT
+
+
 ################################################################################
 #action functions
-
 ipfixcol_start() {
         local ARGS
         local RC
@@ -437,7 +470,7 @@ ipfixcol_validate_deep() {
         if [ -n "$OCF_RESKEY_startup_conf" -a ! -f "$OCF_RESKEY_startup_conf" ]; then
                 ERR="startup configuration file doesn't exist: \"${OCF_RESKEY_startup_conf}\""
                 ocf_log err "${LOG_PREFIX}${ERR}"
-                return "$OCF_ERR_INSTALLED"i
+                return "$OCF_ERR_INSTALLED"
         fi
 
         if [ -n "$OCF_RESKEY_internal_conf" -a ! -f "$OCF_RESKEY_internal_conf" ]; then
@@ -612,8 +645,9 @@ get_pids() {
 get_pidlist() {
         tr "\n" " " <"$PIDFILE"
 }
-################################################################################
 
+
+################################################################################
 #initialization
 : "${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}"
 . "${OCF_FUNCTIONS_DIR}/ocf-shellfuncs"
