@@ -69,8 +69,8 @@ transient_update() {
                 # pidfile exists
                 ACTION="update"
                 local PID="$(head -1 "$PIDFILE")"
-                # ETIME is elapsed time since the main process was started, in seconds
-                local ETIME="$(ps -p "$PID" -o etimes= | tr -d "[[:space:]]")"
+                # elapsed time (in sedonds) since the main process was started
+                local ETIME="$(ps -p "$PID" -o etimes= | tr -d "[:space:]")"
 
                 # force upper limit to ETIME_MAX
                 if [ "$ETIME" -gt "$ETIME_MAX" ]; then
@@ -81,8 +81,9 @@ transient_update() {
                 ACTION="delete"
         fi
 
-        if attrd_updater --name $NAME --$ACTION $ETIME; then
-                ocf_log debug "${LOG_PREFIX}successfully ${ACTION}d transient attribute \"$NAME\" to \"$ETIME\""
+        if attrd_updater --name "$NAME" "--$ACTION" $ETIME; then
+                ocf_log debug "${LOG_PREFIX}successfully ${ACTION}d transient" \
+                        "attribute \"$NAME\" to \"$ETIME\""
         else
                 ERR="failed to $ACTION transient attribute \"$NAME\""
                 ocf_log err "${LOG_PREFIX}${ERR}"
@@ -157,50 +158,54 @@ ipfixcol_start() {
 }
 
 ipfixcol_stop() {
-        local TIMEOUT=5 #stop timeout
-        local WAITING=0
-
         ocf_log debug "${LOG_PREFIX}ipfixcol_stop()"
 
-        #if resource is already stopped, return success immediately
+        # if the resource is already stopped, return success immediately
         if ! ipfixcol_monitor; then
                 ocf_log info "${LOG_PREFIX}not running"
                 return "$OCF_SUCCESS"
         fi
 
-        local PIDLIST=$(get_pidlist) #pidfile exists
+        local PIDLIST=$(get_pidlist)  # pidfile exists
 
-        #send SIGTERM to all PIDs from pidfile, in case it's not successfull send SIGKILL
+        # send SIGTERM to all processes from pidfile, in case it's not
+        # successfull send SIGKILL
+        local SIGNAL
         for SIGNAL in TERM KILL; do
-                if kill -s "${SIGNAL}" $PIDLIST; then
-                        ocf_log info "${LOG_PREFIX}sent SIG${SIGNAL} to PID(s) $PIDLIST"
+                if kill -s "$SIGNAL" $PIDLIST; then
+                        ocf_log info "${LOG_PREFIX}sent SIG$SIGNAL to" \
+                                "process(es) $PIDLIST"
                 else
-                        ocf_log warn "${LOG_PREFIX}failed to send SIG${SIGNAL} to PID(s) $PIDLIST"
+                        ocf_log warn "${LOG_PREFIX}failed to send SIG$SIGNAL" \
+                                "to process(es) $PIDLIST"
                 fi
 
+                local TIMEOUT=5  # stop timeout
+                local WAITING=0
                 while [ $WAITING -lt $TIMEOUT ]; do
                         sleep 1
                         WAITING=$((WAITING+1))
 
                         ipfixcol_monitor
                         if [ $? -eq "$OCF_NOT_RUNNING" ]; then
-                                ocf_log info "${LOG_PREFIX}SIG${SIGNAL} successfully stopped all PIDs"
-                                rm -f "${PIDFILE}" #in case IPFIXcol didn't delete it
-                                return "$OCF_SUCCESS"
+                                break 2
                         fi
                 done
 
-                ocf_log warn "${LOG_PREFIX}SIG${SIGNAL} failed to stop one or more PIDs"
+                ocf_log warn "${LOG_PREFIX}SIG$SIGNAL failed to stop one or" \
+                       "more processes"
         done
 
-        #spin on monitor until all PIDs are dead or until Pacemaker's timeout kicks in
+        # spin on monitor until all processes are dead or until Pacemaker's
+        # timeout kicks in
         while (ipfixcol_monitor; [ $? -ne "$OCF_NOT_RUNNING" ]); do
                 ocf_log debug "${LOG_PREFIX}after stop monitor spin"
                 sleep 1
         done
 
-        ocf_log info "${LOG_PREFIX}successfully stopped all PIDs"
-        rm -f "${PIDFILE}" #in case IPFIXcol didn't delete it
+        ocf_log info "${LOG_PREFIX}SIG$SIGNAL successfully stopped all" \
+                "processes"
+        rm -f "$PIDFILE"  # in case IPFIXcol didn't delete it
         return "$OCF_SUCCESS"
 }
 
