@@ -172,24 +172,23 @@ ipfixcol_stop() {
         # successfull send SIGKILL
         local SIGNAL
         for SIGNAL in TERM KILL; do
-                if kill -s "$SIGNAL" $PIDLIST; then
-                        ocf_log info "${LOG_PREFIX}sent SIG$SIGNAL to" \
-                                "process(es) $PIDLIST"
-                else
-                        ocf_log warn "${LOG_PREFIX}failed to send SIG$SIGNAL" \
-                                "to process(es) $PIDLIST"
-                fi
+                local TRIES=3  # stop timeout
+                local TRY=0
+                while [ $TRY -lt $TRIES ]; do
+                        if kill -s "$SIGNAL" $PIDLIST; then
+                                ocf_log info "${LOG_PREFIX}sent SIG$SIGNAL to" \
+                                        "process(es) $PIDLIST"
+                        else
+                                ocf_log warn "${LOG_PREFIX}failed to send" \
+                                        "SIG$SIGNAL to process(es) $PIDLIST"
+                        fi
 
-                local TIMEOUT=5  # stop timeout
-                local WAITING=0
-                while [ $WAITING -lt $TIMEOUT ]; do
-                        sleep 1
-                        WAITING=$((WAITING+1))
-
+                        sleep 3
                         ipfixcol_monitor
                         if [ $? -eq "$OCF_NOT_RUNNING" ]; then
                                 break 2
                         fi
+                        TRY=$((TRY+1))
                 done
 
                 ocf_log warn "${LOG_PREFIX}SIG$SIGNAL failed to stop one or" \
@@ -203,8 +202,7 @@ ipfixcol_stop() {
                 sleep 1
         done
 
-        ocf_log info "${LOG_PREFIX}SIG$SIGNAL successfully stopped all" \
-                "processes"
+        ocf_log info "${LOG_PREFIX}SIG$SIGNAL stopped all processes"
         rm -f "$PIDFILE"  # in case IPFIXcol didn't delete it
         return "$OCF_SUCCESS"
 }
