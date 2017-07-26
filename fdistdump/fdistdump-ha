@@ -55,12 +55,14 @@ OUTPUT_PREFIX = os.path.basename(__file__).upper() if '__file__' in globals() \
     else 'FDISTDUMP-HA'
 
 binaries = {
-    'fdistdump': 'fdistdump',
-    'mpi': 'mpiexec',
     'node': 'crm_node',
     'mon': 'crm_mon',
     'attribute': 'crm_attribute'
 }
+# check presence of used binaries
+for key, value in binaries.items():
+    if shutil.which(value) is None:
+        raise OSError('executable "{}" not found.'.format(value))
 
 
 ###############################################################################
@@ -82,8 +84,12 @@ class GraphError(Error):
 
 
 ###############################################################################
-def myformatverbose(*args, **kwargs):
+def verbose_print_formatter(*args, **kwargs):
     print(OUTPUT_PREFIX, 'VERBOSE:', *args, **kwargs)
+
+
+def verbose_print_formatter_void(*args, **kwargs):
+    pass
 
 
 def myformatwarning(message, category, filename, lineno, line=None):
@@ -459,7 +465,7 @@ class ClusterHealthMonitor:
         self.online_set = online_ref_set
         self.nodes_dict = nodes_dict
         self.termination_timer = threading.Timer(
-            args.termination_timeout.total_seconds(), self._terminate)
+            ha_args.termination_timeout.total_seconds(), self._terminate)
         self.terminated = False
 
     def __del(self):
@@ -504,16 +510,16 @@ class ClusterHealthMonitor:
             # check if the state has changed
             if self.state != state_new:
                 state_status = 'denied' if \
-                    self.state.is_denied(args.allowed_state) else 'allowed'
+                    self.state.is_denied(ha_args.allowed_state) else 'allowed'
                 state_new_status = 'denied' if \
-                    state_new.is_denied(args.allowed_state) else 'allowed'
+                    state_new.is_denied(ha_args.allowed_state) else 'allowed'
 
                 warnings.warn('{}: transition from the {} state <{}> to the '
                               '{} state <{}>'.format(type(self).__name__,
                                                      state_status, self.state,
                                                      state_new_status,
                                                      state_new))
-                if state_new.is_denied(args.allowed_state):
+                if state_new.is_denied(ha_args.allowed_state):
                     # transition to the denied state, start the timer
                     if not self.termination_timer.is_alive():
                         self.termination_timer.start()
@@ -521,7 +527,7 @@ class ClusterHealthMonitor:
                     # transition to the allowed state, cancel the timer
                     self.termination_timer.cancel()
                     self.termination_timer = threading.Timer(
-                        args.termination_timeout.total_seconds(),
+                        ha_args.termination_timeout.total_seconds(),
                         self._terminate)
 
             self.state.update(state_new)
@@ -581,15 +587,15 @@ def run_job():
 
     # construct hosts and appropriate paths based on the current cluster status
     hosts, base_paths = construct_hosts_and_paths(nodes_dict, setup_dict)
-    mpi_hosts = ','.join(hosts)  # comma separated hostnames
+    mpiexec_hosts = ','.join(hosts)  # comma separated hostnames
     fdistdump_paths = []  # space separated paths
     for base_path in base_paths:
         fdistdump_paths += [shlex.quote(os.path.join(base_path, user_path))
                             for user_path in user_paths]
 
     # get reference set of online nodes and run the job
-    subprocess_args = (mpi_args + [mpi_hosts] + priority_args + fdistdump_args
-                       + fdistdump_paths)
+    subprocess_args = (mpiexec_argv + ['-host', mpiexec_hosts] + priority_args
+                       + fdistdump_argv + fdistdump_paths)
     verbose_print('launching command:', ' '.join([shlex.quote(arg)
                   for arg in subprocess_args]))
     global mpi_job_proc
@@ -599,7 +605,7 @@ def run_job():
     with ClusterHealthMonitor(get_online_set(), nodes_dict) as chm:
         while mpi_job_proc.poll() is None:
             chm.update(get_online_set())
-            time.sleep(args.health_monitoring_interval.total_seconds())
+            time.sleep(ha_args.health_monitoring_interval.total_seconds())
         else:
             if chm.terminated:
                 raise ClusterHealthMonitor.ClusterHealthMonitorError(
@@ -642,35 +648,76 @@ if __name__ == "__main__":
     # set my format for warning print function
     warnings.formatwarning = myformatwarning
 
-    # On some distros (Fedora, RHEL), the binaries MUST be suffixed with
-    # $MPI_SUFFIX (e.g. _openmpi for Open MPI, _mpich for MPICH, ...)
-    mpi_suffix = os.environ.get('MPI_SUFFIX')
-    if mpi_suffix is not None:
-        binaries['fdistdump'] += mpi_suffix
-
-    # check presence of used binaries
-    for key, value in binaries.items():
-        if shutil.which(value) is None:
-            raise OSError('executable "{}" not found.'.format(value))
+    # split arguments into fdistdump-ha, mpiexec, and fdistdump arguments
+    hyphens_idx = next((idx for idx, val in enumerate(sys.argv[1:], 1) if
+                       val == '--'), sys.maxsize)
+    mpiexec_argv_idx = next((idx for idx, val in enumerate(sys.argv[1:], 1) if
+                            'mpiexec' in val), sys.maxsize)
+    fdistdump_argv_idx = next((idx for idx, val in enumerate(sys.argv[1:], 1)
+                              if 'fdistdump' in val), sys.maxsize)
+    if hyphens_idx < mpiexec_argv_idx and hyphens_idx < fdistdump_argv_idx:
+        # abbreviated form with FDISTDUMP_ARGS
+        ha_argv = sys.argv[:hyphens_idx]
+        fdistdump_argv = [None] + sys.argv[hyphens_idx + 1:]
+        mpiexec_argv = [None]
+    elif mpiexec_argv_idx < fdistdump_argv_idx:
+        # full form, MPIEXEC first
+        ha_argv = sys.argv[:mpiexec_argv_idx]
+        mpiexec_argv = sys.argv[mpiexec_argv_idx:fdistdump_argv_idx]
+        fdistdump_argv = (sys.argv[fdistdump_argv_idx:] if fdistdump_argv_idx <
+                          sys.maxsize else [None])
+    elif fdistdump_argv_idx < mpiexec_argv_idx:
+        # full form, FDISTDUMP first
+        ha_argv = sys.argv[:fdistdump_argv_idx]
+        mpiexec_argv = (sys.argv[mpiexec_argv_idx:] if mpiexec_argv_idx <
+                        sys.maxsize else [None])
+        fdistdump_argv = sys.argv[fdistdump_argv_idx:mpiexec_argv_idx]
+    else:
+        # abbreviated form without FDISTDUMP_ARGS
+        ha_argv = sys.argv
+        mpiexec_argv = [None]
+        fdistdump_argv = [None]
 
     ########################################
-    # process command line arguments
-    # set and parse
+    # parse fdistdump-ha's command line arguments
     parser = argparse.ArgumentParser(
-        description='fdistdump(1) wrapper with support for high-availability '
-        'using Corosync/Pacemaker stack.')
+        description='This script is a wrapper for fdistdump(1) with support '
+        'for high-availability (which lacks in most MPI implementations) '
+        'using a Corosync/Pacemaker stack. '
 
-    parser.add_argument('-m', '--mpi-args',
-                        dest='user_mpi_args',
-                        help='Arguments passed to the mpiexec(1) command.')
-    parser.add_argument('-f', '--fdistdump-args',
-                        dest='user_fdistdump_args',
-                        help='Arguments passed to the fdistdump(1) command.')
+        'MPIEXEC is either a name of or an absolute path to the mpiexec(1) '
+        'command (default: mpiexec). In the first case, the command is '
+        'located using the PATH environment variable. It is identified as the '
+        'first argument containing substring "mpiexec". '
+        'MPIEXEC_ARGS are arguments passed to the mpiexec(1) command '
+        '(default: None). Do not use the "-host" option, because its argument '
+        'is constructed automatically in runtime (based on current nodes '
+        'health). '
+
+        'FDISTDUMP is either a name of or an absolute path to the '
+        'fdistdump(1) command. In the first case, the command is located '
+        'using the PATH environment variable. On some Fedora-based '
+        'distributions MPI binaries must be suffixed with a MPI_SUFFIX '
+        'environment variable (e.g., _openmpi for Open MPI or _mpich for '
+        'MPICH). The default value is thus "fdistdump$MPI_SUFFIX" if '
+        'MPI_SUFFIX is defined, "fdistdump" otherwise. It is identified as '
+        'the first argument containing substring "fdistdump". Instead of '
+        'specifying paths here, use the positional argument in the {}_ARGS. '
+        'FDISTDUMP_ARGS are arguments passed to the fdistdump(1) command '
+        '(default: None).'
+        .format(os.path.basename(sys.argv[0]).upper()),
+
+        usage='\t{0} [{1}_ARGS] [-- FDISTDUMP_ARGS]\n'
+        '\t{0} [{1}_ARGS] [MPIEXEC [MPIEXEC_ARGS]] [FDISTDUMP '
+        '[FDISTDUMP_ARGS]]'.format(os.path.basename(sys.argv[0]),
+                                   os.path.basename(sys.argv[0]).upper()),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     parser.add_argument('-a', '--allowed-cluster-state',
                         dest='allowed_state',
                         nargs='+',
                         choices=['online', 'offline'],
+                        default=None,
                         help='Allow the job to continue even if the '
                         'ClusterHealthMonitor enter the specified state(s). '
                         'States are relative to the reference state '
@@ -689,15 +736,13 @@ if __name__ == "__main__":
                         type=argument_type_timedelta,
                         default=datetime.timedelta(seconds=1),
                         help='Check changes in the health of the cluster '
-                        'every HEALTH-MONITORING-INTERVAL seconds. '
-                        'The defaults is 1 second.')
+                        'every HEALTH-MONITORING-INTERVAL seconds.')
     parser.add_argument('-e', '--termination-timeout',
                         dest='termination_timeout',
                         type=argument_type_timedelta,
                         default=datetime.timedelta(seconds=10),
                         help='Terminate the job after specified amount of '
-                        'seconds spent in one of denied states. '
-                        'The default is 10 seconds.')
+                        'seconds spent in one of denied states.')
     parser.add_argument('-t', '--tries',
                         dest='tries',
                         type=argument_type_positive_int,
@@ -709,78 +754,117 @@ if __name__ == "__main__":
                         'options), it can be automatically restarted with '
                         'updated refernece state according to the current '
                         'situation. This option sets number of tries before '
-                        'giving up. Specify 0 for ' 'infinite retrying. '
-                        'The default is 1 try.')
+                        'giving up. Specify 0 for ' 'infinite retrying.')
 
     parser.add_argument('-p', '--priority',
                         dest='priority',
                         choices=['low', 'normal', 'high'],
+                        default='normal',
                         help='Run fdistdump with adjusted '
                         'niceness and I/O scheduling class. For more '
                         'information see nice(1) and ionice(1).')
     parser.add_argument('-v', '--verbose',
                         dest='verbose',
                         action='store_true',
+                        default=False,
                         help='Be verbose.')
 
     parser.add_argument('path',
                         nargs='+',
-                        help='Path to your flow '
-                        'file/directory relative to the "flow-primary-brick" '
-                        'Pacemaker property, e.g. path will be "2016/07/" if '
-                        'you want to process all flow files from July 2016.')
-    args = parser.parse_args()
+                        help='Path to your flow file/directory relative to '
+                        'the "flow-primary-brick" Pacemaker property. If you '
+                        'are not using profiles, it can be just "2016/07/" if '
+                        'you want to process all flow files from July 2016. '
+                        'If you are using profiles, your path should start '
+                        'with a name of the required profile, e.g., '
+                        '"live/channels/smtp/2016/07/" if you want to '
+                        'process all flow files belonging to profile "live", '
+                        'channel "smtp" from July 2016.')
+    ha_args = parser.parse_args(ha_argv[1:])
+
+    ########################################
+    # validate and handle command line arguments
+    # define verbose print function
+    if ha_args.verbose:
+        verbose_print = verbose_print_formatter
+    else:
+        verbose_print = verbose_print_formatter_void
+
+    # construct and check mpiexec args, hosts are added later
+    if mpiexec_argv[0] is None:
+        mpiexec_argv[0] = 'mpiexec'
+        verbose_print('arguments: MPIEXEC is not defined, using default '
+                      'value "{}"'.format(mpiexec_argv[0]))
+    elif shutil.which(mpiexec_argv[0]) is None:
+        raise ValueError('"{}" is not a valid mpiexec command (PATH '
+                         'lookup failed)'.format(mpiexec_argv[0]))
+    if '-host' in mpiexec_argv:
+        raise ValueError('arguments: mpiexec argument "-host" is forbidden')
+    if '-wdir' not in mpiexec_argv:
+        mpiexec_argv += ['-wdir', '/tmp/']
+
+    # construct and check fdistdump args
+    if fdistdump_argv[0] is None:
+        mpi_suffix = os.environ.get('MPI_SUFFIX')
+        if mpi_suffix is None:
+            fdistdump_argv[0] = 'fdistdump'
+        else:
+            fdistdump_argv[0] = 'fdistdump' + mpi_suffix
+        verbose_print('arguments: FDISTDUMP is not defined, using default '
+                      'value "{}"'.format(fdistdump_argv[0]))
+    # test fdistdump command existence
+    if shutil.which(fdistdump_argv[0]) is None:
+        # only warning, command may be valid on the remote nodes
+        warnings.warn('arguments: "{}" is not a valid fdistdump command on '
+                      'this node (PATH lookup failed)'
+                      .format(fdistdump_argv[0]))
+
+    verbose_print('arguments:', ha_argv[0], ha_argv[1:])
+    verbose_print('arguments:', mpiexec_argv[0], mpiexec_argv[1:])
+    verbose_print('arguments:', fdistdump_argv[0], fdistdump_argv[1:])
 
     # pick only relative paths from user arguments
     user_paths = []
-    for path in args.path:
+    for path in ha_args.path:
         if path[0] == '/':
-            warnings.warn('skipping absolute path "{}"'.format(path))
+            warnings.warn('arguments: skipping absolute path "{}"'
+                          .format(path))
         else:
             user_paths.append(path)
     if len(user_paths) == 0:
-        raise ValueError('no valid path.')
+        raise ValueError('arguments: no valid path')
 
     # handle priority classes
-    # don't change anything if class not set or set to normal
-    priority_args = []
-    if args.priority == 'low':
+    if ha_args.priority == 'low':
         priority_args = ['nice', '-n', '10', 'ionice', '-c', '3']
-    elif args.priority == 'high':
+    elif ha_args.priority == 'normal':
+        priority_args = []  # don't change anything if class is set to normal
+    elif ha_args.priority == 'high':
         priority_args = ['nice', '-n', '-10', 'ionice', '-c', '1']
-
-    # construct fdistdump arguments
-    fdistdump_args = [binaries['fdistdump']]
-    if args.user_fdistdump_args:
-        fdistdump_args += shlex.split(args.user_fdistdump_args)
-
-    # construct MPI args, hosts are added later based on their current status
-    mpi_args = [binaries['mpi'], '-wdir', '/tmp/', '-host']
-    if args.user_mpi_args:
-        mpi_args += shlex.split(args.user_mpi_args)
+    else:
+        raise ValueError('arguments: invalid priority class "{}"'
+                         .format(ha_args.priority))
 
     # handle restarts
     DOWN_LIMIT = datetime.timedelta(seconds=5)
 
-    # define verbose print function
-    verbose_print = myformatverbose if args.verbose else lambda *a, **k: None
-
     # handle denied states
-    if args.allowed_state:
-        args.allowed_state = ClusterHealthMonitor.State(
-            'online' in args.allowed_state, 'offline' in args.allowed_state)
+    if ha_args.allowed_state:
+        ha_args.allowed_state = ClusterHealthMonitor.State(
+            'online' in ha_args.allowed_state,
+            'offline' in ha_args.allowed_state)
     else:
-        args.allowed_state = ClusterHealthMonitor.State()
+        ha_args.allowed_state = ClusterHealthMonitor.State()
 
     ########################################
     mpi_job_proc = None  # make the subprocess object global for signal handler
     tries = 0
     while True:
         tries += 1
-        if args.tries == 0:
+        if ha_args.tries == 0:
             verbose_print('try {}'.format(tries))
-        elif tries <= args.tries:
-            verbose_print('try {}/{}'.format(tries, args.tries))
+        elif tries <= ha_args.tries:
+            verbose_print('try {}/{}'.format(tries, ha_args.tries))
         else:
             warnings.warn('no more tries, giving up')
             rc = None
@@ -797,7 +881,8 @@ if __name__ == "__main__":
             if rc < 0:
                 warnings.warn('job was terminated by a signal')
             elif rc > 0:
-                warnings.warn('job terminated with non-zero exit code', rc)
+                warnings.warn('job terminated with non-zero exit code {}'
+                              .format(rc))
             break
         finally:
             if mpi_job_proc is not None and mpi_job_proc.poll() is None:
