@@ -301,7 +301,7 @@ def graph_check_validity(nodes_dict):
     succ_id = nodes_dict[node_id]['successor']
 
     if node_id == succ_id:
-        warnings.warn('self-loop doesn\'t make sense')
+        warnings.warn('graph validity check: self-loop doesn\'t make sense')
         return
 
     while succ_id in subcoll_set:
@@ -379,7 +379,8 @@ def construct_hosts_and_paths(nodes_dict, setup_dict):
             succ = nodes_dict[sub]['successor']
             succ_name = nodes_dict[succ]['name']
 
-            warn_msg = 'node {} ({}) isn\'t online, '.format(sub, sub_name)
+            warn_msg = 'run: node {} ({}) isn\'t online, '.format(sub,
+                                                                  sub_name)
             if succ in online_set:
                 # successor is online, still change to have a complete data set
                 succ_idx = slave_names.index(succ_name) + 1
@@ -406,21 +407,21 @@ def construct_hosts_and_paths(nodes_dict, setup_dict):
 
 
 def terminate_job(job_popen, timeout):
-    verbose_print('sending SIGTERM')
+    verbose_print('termination: sending SIGTERM')
     job_popen.terminate()
     try:
         job_popen.wait(timeout)
     except subprocess.TimeoutExpired:
-        verbose_print('SIGTERM did not work. Sending SIGKILL')
+        verbose_print('termination: SIGTERM did not work. Sending SIGKILL')
         job_popen.kill()
         try:
             job_popen.wait(timeout)
         except subprocess.TimeoutExpired:
-            verbose_print('SIGKILL did not work, giving up')
+            verbose_print('termination: SIGKILL did not work, giving up')
         else:
-            verbose_print('SIGKILL has terminated the job')
+            verbose_print('termination: SIGKILL has terminated the job')
     else:
-        verbose_print('SIGTERM has terminated the job')
+        verbose_print('termination: SIGTERM has terminated the job')
 
 
 def signal_handler(signal, frame):
@@ -434,24 +435,24 @@ def signal_handler(signal, frame):
     responsibility to terminate the job -- first by SIGTERM, then by SIGKILL.
     """
 
-    warnings.warn('received signal {}, terminating the job and exitting as '
-                  'soon as possible'.format(signal))
+    warnings.warn('termination: received signal {}, terminating the job and '
+                  'exitting as soon as possible'.format(signal))
     timeout = 5
 
     if ('mpi_job_proc' not in globals()
             or mpi_job_proc is None
             or mpi_job_proc.poll() is not None):
-        verbose_print('job is not running, exiting immediately')
+        verbose_print('termination: job is not running, exiting immediately')
     else:
-        verbose_print('job is running, waiting {} seconds for job to '
-                      'self-terminate'.format(timeout))
+        verbose_print('termination: job is running, waiting {} seconds for '
+                      'job to self-terminate'.format(timeout))
         try:
             mpi_job_proc.wait(timeout)
         except subprocess.TimeoutExpired:
-            verbose_print('job did not self-terminate')
+            verbose_print('termination: job did not self-terminate')
             terminate_job(mpi_job_proc, timeout)
         else:
-            verbose_print('job has self-terminated')
+            verbose_print('termination: job has self-terminated')
 
     sys.exit()  # only raises the SystemExit exception
 
@@ -596,7 +597,7 @@ def run_job():
     # get reference set of online nodes and run the job
     subprocess_args = (mpiexec_argv + ['-host', mpiexec_hosts] + priority_args
                        + fdistdump_argv + fdistdump_paths)
-    verbose_print('launching command:', ' '.join([shlex.quote(arg)
+    verbose_print('run:', ' '.join([shlex.quote(arg)
                   for arg in subprocess_args]))
     global mpi_job_proc
     mpi_job_proc = subprocess.Popen(subprocess_args)
@@ -862,11 +863,11 @@ if __name__ == "__main__":
     while True:
         tries += 1
         if ha_args.tries == 0:
-            verbose_print('try {}'.format(tries))
+            verbose_print('run: try {}'.format(tries))
         elif tries <= ha_args.tries:
-            verbose_print('try {}/{}'.format(tries, ha_args.tries))
+            verbose_print('run: try {}/{}'.format(tries, ha_args.tries))
         else:
-            warnings.warn('no more tries, giving up')
+            warnings.warn('run: no more tries, giving up')
             rc = None
             break
 
@@ -877,16 +878,16 @@ if __name__ == "__main__":
             continue
         else:
             # job success of failure, don't try again
-            verbose_print('job exit code = {}'.format(rc))
+            verbose_print('run: job exit code = {}'.format(rc))
             if rc < 0:
-                warnings.warn('job was terminated by a signal')
+                warnings.warn('run: job was terminated by a signal')
             elif rc > 0:
-                warnings.warn('job terminated with non-zero exit code {}'
+                warnings.warn('run: job terminated with non-zero exit code {}'
                               .format(rc))
             break
         finally:
             if mpi_job_proc is not None and mpi_job_proc.poll() is None:
-                warnings.warn('job should not be running now, but it is. '
+                warnings.warn('run: job should not be running now, but it is. '
                               'Terminating')
                 terminate_job(mpi_job_proc, 5)
 
