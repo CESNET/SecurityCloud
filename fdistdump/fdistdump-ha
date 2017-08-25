@@ -84,11 +84,13 @@ class GraphError(Error):
 
 
 ###############################################################################
-def verbose_print_formatter(*args, **kwargs):
+def vprint_formatter(*args, **kwargs):
+    """Verbose-enabled print formatter."""
     print(OUTPUT_PREFIX, 'VERBOSE:', *args, **kwargs)
 
 
-def verbose_print_formatter_void(*args, **kwargs):
+def vprint_formatter_void(*args, **kwargs):
+    """Verbose-disabled print formatter."""
     pass
 
 
@@ -407,21 +409,21 @@ def construct_hosts_and_paths(nodes_dict, setup_dict):
 
 
 def terminate_job(job_popen, timeout):
-    verbose_print('termination: sending SIGTERM')
+    vprint('termination: sending SIGTERM')
     job_popen.terminate()
     try:
         job_popen.wait(timeout)
     except subprocess.TimeoutExpired:
-        verbose_print('termination: SIGTERM did not work. Sending SIGKILL')
+        vprint('termination: SIGTERM did not work. Sending SIGKILL')
         job_popen.kill()
         try:
             job_popen.wait(timeout)
         except subprocess.TimeoutExpired:
-            verbose_print('termination: SIGKILL did not work, giving up')
+            vprint('termination: SIGKILL did not work, giving up')
         else:
-            verbose_print('termination: SIGKILL has terminated the job')
+            vprint('termination: SIGKILL has terminated the job')
     else:
-        verbose_print('termination: SIGTERM has terminated the job')
+        vprint('termination: SIGTERM has terminated the job')
 
 
 def signal_handler(signal, frame):
@@ -442,17 +444,17 @@ def signal_handler(signal, frame):
     if ('mpi_job_proc' not in globals()
             or mpi_job_proc is None
             or mpi_job_proc.poll() is not None):
-        verbose_print('termination: job is not running, exiting immediately')
+        vprint('termination: job is not running, exiting immediately')
     else:
-        verbose_print('termination: job is running, waiting {} seconds for '
-                      'job to self-terminate'.format(timeout))
+        vprint('termination: job is running, waiting {} seconds for job to '
+               'self-terminate'.format(timeout))
         try:
             mpi_job_proc.wait(timeout)
         except subprocess.TimeoutExpired:
-            verbose_print('termination: job did not self-terminate')
+            vprint('termination: job did not self-terminate')
             terminate_job(mpi_job_proc, timeout)
         else:
-            verbose_print('termination: job has self-terminated')
+            vprint('termination: job has self-terminated')
 
     sys.exit()  # only raises the SystemExit exception
 
@@ -597,8 +599,7 @@ def run_job():
     # get reference set of online nodes and run the job
     subprocess_args = (mpiexec_argv + ['-host', mpiexec_hosts] + priority_args
                        + fdistdump_argv + fdistdump_paths)
-    verbose_print('run:', ' '.join([shlex.quote(arg)
-                  for arg in subprocess_args]))
+    vprint('run:', ' '.join([shlex.quote(arg) for arg in subprocess_args]))
     global mpi_job_proc
     mpi_job_proc = subprocess.Popen(subprocess_args)
 
@@ -786,16 +787,13 @@ if __name__ == "__main__":
     ########################################
     # validate and handle command line arguments
     # define verbose print function
-    if ha_args.verbose:
-        verbose_print = verbose_print_formatter
-    else:
-        verbose_print = verbose_print_formatter_void
+    vprint = vprint_formatter if ha_args.verbose else vprint_formatter_void
 
     # construct and check mpiexec args, hosts are added later
     if mpiexec_argv[0] is None:
         mpiexec_argv[0] = 'mpiexec'
-        verbose_print('arguments: MPIEXEC is not defined, using default '
-                      'value "{}"'.format(mpiexec_argv[0]))
+        vprint('arguments: MPIEXEC is not defined, using default value "{}"'
+               .format(mpiexec_argv[0]))
     elif shutil.which(mpiexec_argv[0]) is None:
         raise ValueError('"{}" is not a valid mpiexec command (PATH '
                          'lookup failed)'.format(mpiexec_argv[0]))
@@ -811,8 +809,8 @@ if __name__ == "__main__":
             fdistdump_argv[0] = 'fdistdump'
         else:
             fdistdump_argv[0] = 'fdistdump' + mpi_suffix
-        verbose_print('arguments: FDISTDUMP is not defined, using default '
-                      'value "{}"'.format(fdistdump_argv[0]))
+        vprint('arguments: FDISTDUMP is not defined, using default value "{}"'
+               .format(fdistdump_argv[0]))
     # test fdistdump command existence
     if shutil.which(fdistdump_argv[0]) is None:
         # only warning, command may be valid on the remote nodes
@@ -820,9 +818,9 @@ if __name__ == "__main__":
                       'this node (PATH lookup failed)'
                       .format(fdistdump_argv[0]))
 
-    verbose_print('arguments:', ha_argv[0], ha_argv[1:])
-    verbose_print('arguments:', mpiexec_argv[0], mpiexec_argv[1:])
-    verbose_print('arguments:', fdistdump_argv[0], fdistdump_argv[1:])
+    vprint('arguments:', ha_argv[0], ha_argv[1:])
+    vprint('arguments:', mpiexec_argv[0], mpiexec_argv[1:])
+    vprint('arguments:', fdistdump_argv[0], fdistdump_argv[1:])
 
     # pick only relative paths from user arguments
     user_paths = []
@@ -863,9 +861,9 @@ if __name__ == "__main__":
     while True:
         tries += 1
         if ha_args.tries == 0:
-            verbose_print('run: try {}'.format(tries))
+            vprint('run: try {}'.format(tries))
         elif tries <= ha_args.tries:
-            verbose_print('run: try {}/{}'.format(tries, ha_args.tries))
+            vprint('run: try {}/{}'.format(tries, ha_args.tries))
         else:
             warnings.warn('run: no more tries, giving up')
             rc = None
@@ -878,7 +876,7 @@ if __name__ == "__main__":
             continue
         else:
             # job success of failure, don't try again
-            verbose_print('run: job exit code = {}'.format(rc))
+            vprint('run: job exit code = {}'.format(rc))
             if rc < 0:
                 warnings.warn('run: job was terminated by a signal')
             elif rc > 0:
