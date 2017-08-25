@@ -1,0 +1,458 @@
+#!/usr/bin/env python3
+
+# author: Jan Wrona, wrona@cesnet.cz
+
+# Copyright (C) 2017 CESNET
+#
+# LICENSE TERMS
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in
+#    the documentation and/or other materials provided with the
+#    distribution.
+# 3. Neither the name of the Company nor the names of its contributors
+#    may be used to endorse or promote products derived from this
+#    software without specific prior written permission.
+#
+# ALTERNATIVELY, provided that this notice is retained in full, this
+# product may be distributed under the terms of the GNU General Public
+# License (GPL) version 2 or later, in which case the provisions
+# of the GPL apply INSTEAD OF those given above.
+#
+# This software is provided ``as is'', and any express or implied
+# warranties, including, but not limited to, the implied warranties of
+# merchantability and fitness for a particular purpose are disclaimed.
+# In no event shall the company or contributors be liable for any
+# direct, indirect, incidental, special, exemplary, or consequential
+# damages (including, but not limited to, procurement of substitute
+# goods or services; loss of use, data, or profits; or business
+# interruption) however caused and on any theory of liability, whether
+# in contract, strict liability, or tort (including negligence or
+# otherwise) arising in any way out of the use of this software, even
+# if advised of the possibility of such damage.
+
+
+import os
+import re
+import argparse
+import datetime
+import warnings
+from pathlib import Path
+
+
+OUTPUT_PREFIX = os.path.basename(__file__).upper() if '__file__' in globals() \
+    else 'DATA-MANAGER'
+
+DU_UPPER_BOUND_LIMIT = 95.0
+DU_LOWER_BOUND_LIMIT = 5.0
+DU_BOUND_DIFFERENCE_LIMIT = 10.0
+
+# strftime()/strptime() translation table
+STRTIME_DICT = {'year': '%Y', 'month': '%m', 'day': '%d', 'hour': '%H',
+                'minute': '%M', 'second': '%S'}
+# strftime()/strptime() formats for YYYYMMDDHHMM and YYYYMMDDHHMMSS
+STRTIME_FORMAT_YMDHM = (STRTIME_DICT['year'] + STRTIME_DICT['month']
+                        + STRTIME_DICT['day'] + STRTIME_DICT['hour']
+                        + STRTIME_DICT['minute'])
+STRTIME_FORMAT_YMDHMS = STRTIME_FORMAT_YMDHM + STRTIME_DICT['second']
+# re match pattern for YYYYMMDDHHMM or YYYYMMDDHHMMSS
+DATETIME_PATTERN = (r'(?P<year>\d{4})(?P<month>\d{2})(?P<day>\d{2})'
+                    r'(?P<hour>\d{2})(?P<minute>\d{2})'
+                    r'(?P<second>\d{2})?')
+# precompiled regex for YYYYMMDDHHMM or YYYYMMDDHHMMSS
+DATETIME_REGEX = re.compile(DATETIME_PATTERN, re.ASCII)
+
+
+###############################################################################
+class Node:
+    """Representation of a node with multiple base profiles.
+
+    In the usual case, list of base profiles usualy contains just single base
+    profile called "live"
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.profiles = []
+
+    def __repr__(self):
+        return '{}(name={}, profiles={})'.format(type(self).__name__,
+                                                 self.path.name, self.profiles)
+
+    def scan(self):
+        self.profiles.clear()
+
+        for profile_dir in dir_scan(self.path, 'node'):
+            profile = Profile(profile_dir, self)
+            profile.scan()
+            self.profiles.append(profile)
+
+
+class Profile:
+    """IPFIXcol (sub)profile representation."""
+
+    def __init__(self, path, parent):
+        self.path = path  # pathlib path to the profile's base directory
+        self.parent = parent  # profile's parent Profile or Node
+        self.channels = []
+        self.subprofiles = []
+
+    def __repr__(self):
+        return '{}(name={}, parent={}, channels={}, subprofiles={})'\
+            .format(type(self).__name__, self.path.name, self.parent.path.name,
+                    self.channels, self.subprofiles)
+
+    def scan(self):
+        self.channels.clear()
+        self.subprofiles.clear()
+
+        # subprofiles and channels are alphabetically sorted due to lists
+        # equality comaprison
+        for subdir in sorted(dir_scan(self.path, 'profile')):
+            vprint('profile "{}":'.format(self.path.name), end=' ')
+            if subdir.name == 'channels':
+                vprint('adding channels', use_prefix=False)
+                for channel_dir in sorted(dir_scan(subdir, 'profile/channel')):
+                    channel = self.Channel(channel_dir, self)
+                    channel.scan()
+                    self.channels.append(channel)
+            elif subdir.name == 'rrd':
+                vprint('ignoring RRD directory', use_prefix=False)
+            else:
+                vprint('adding subprofile "{}"'.format(subdir.name),
+                       use_prefix=False)
+                profile = Profile(subdir, self)
+                profile.scan()
+                self.subprofiles.append(profile)
+
+        if not self.channels:
+            raise Exception('profile "{}" is missing the "channels" directory'
+                            .format(self.path.name))
+
+    def get_channels(self, recursively=False):
+        channels = list(self.channels)  # make a copy
+        if recursively:
+            for subprofile in self.subprofiles:
+                channels += subprofile.get_channels(recursively)
+        return channels
+
+    class Channel:
+        """IPFIXcol channel representation."""
+
+        def __init__(self, path, parent):
+            self.path = path  # pathlib path to the channel's base directory
+            self.parent = parent  # channel's parent Profile
+            self.flow_files = []
+
+        def __repr__(self):
+            return ('{}(name={}, parent={}, earliest_flow_file={}, '
+                    'latest_flow_file={})'
+                    .format(type(self).__name__, self.path.name,
+                            self.parent.path.name,
+                            self.get_earliest_flow_file(),
+                            self.get_latest_flow_file()))
+
+        def get_earliest_flow_file(self):
+            return self.flow_files[0]
+
+        def get_latest_flow_file(self):
+            return self.flow_files[-1]
+
+        def unlink_earliest_flow_file(self):
+            if args.dry_run:
+                earliest = self.get_earliest_flow_file().path  # only retrieves
+                print('would unlink "{}"'.format(earliest))
+            else:
+                earliest = self.flow_files.pop(0).path  # retrieves and removes
+                vprint('unlinking "{}"'.format(earliest))
+                earliest.unlink()
+
+            # print('rmdir "{}"'.format(day_dir))
+            # day_dir.rmdir()
+
+        def scan(self):
+            self.flow_files.clear()
+
+            for path in self.path.rglob('*'):
+                if not path.is_file():
+                    continue
+                elif path.name.startswith('.'):
+                    warnings.warn('channel scan: found invalid file "{}" '
+                                  'in "{}" channel storage hierarchy, skipping'
+                                  .format(path, self.path.name))
+
+                flow_file = self.FlowFile(path, self)
+                try:
+                    flow_file.scan()
+                except ValueError as e:
+                    warnings.warn(e.args[0] + ', skipping')
+                    continue
+
+                self.flow_files.append(flow_file)
+            self.flow_files.sort(key=lambda flow_file: flow_file.datetime)
+
+        class FlowFile:
+            """Flow file representation."""
+
+            def __init__(self, path, parent):
+                self.path = path  # pathlib path to the file
+                self.parent = parent  # file's parent Channel
+                self.datetime = None
+
+            def __repr__(self):
+                return ('{}(name={}, parent={}, datetime={})'
+                        .format(type(self).__name__, self.path.name,
+                                self.parent.path.name, self.datetime))
+
+            def __lt__(self, other):
+                return self.datetime < other.datetime
+
+            def __le__(self, other):
+                return self.datetime <= other.datetime
+
+            def __eq__(self, other):
+                return self.datetime == other.datetime
+
+            def __gt__(self, other):
+                return self.datetime > other.datetime
+
+            def __ge__(self, other):
+                return self.datetime >= other.datetime
+
+            def scan(self):
+                """
+                Lookup YYYYMMDDHHMM or YYYYMMDDHHMMSS pattern in the supplied
+                file name and return a corresponding datetime object.
+                """
+
+                match = DATETIME_REGEX.search(self.path.name)
+                if not match:
+                    raise ValueError('flow file scan: patterns YYYYMMDDHHMM '
+                                     'or YYYYMMDDHHMMSS not found in file\'s '
+                                     '"{}" name'.format(self.path))
+
+                if match.group('second'):
+                    strtime_format = STRTIME_FORMAT_YMDHMS
+                else:
+                    strtime_format = STRTIME_FORMAT_YMDHM
+                self.datetime = datetime.datetime.strptime(match.group(0),
+                                                           strtime_format)
+
+            # def detect_path_format(self, path):
+            #     """
+            #     Just a heuristic which searches for YYYYMMDDHHMM or
+            #     YYYYMMDDHHMMSS pattern in supplied paths's name.
+            #     """
+
+            #     match = re.search(pattern, path.name, re.ASCII)
+            #     if not match:
+            #         raise Exception('channel storage hierarchy detection: "{}": '
+            #                         'pattern YYYYMMDDHHMM or YYYYMMDDHHMMSS not '
+            #                         'found in file\'s name'.format(path))
+
+            #     # construct file name format suitable for strftime()
+            #     name_format  = path.name[:match.start()]
+            #     name_format += (self.strtime_dict['year']
+            #                     + self.strtime_dict['month']
+            #                     + self.strtime_dict['day']
+            #                     + self.strtime_dict['hour']
+            #                     + self.strtime_dict['minute'])
+            #     if match.group('second'):
+            #         name_format += self.strtime_dict['second']
+            #     name_format += path.name[match.end():]
+
+            #     # construct path format suitable for strftime()
+            #     path_format = str(path.parent.relative_to(self.path))
+            #     for key in ['year', 'month', 'day', 'hour', 'minute', 'second']:
+            #         if not match.group(key):
+            #             continue
+            #         path_format = path_format.replace(match.group(key),
+            #                 self.strtime_dict[key], 1)
+
+            #     # join together channel's base path, path format and name format
+            #     self.path_format = Path(self.path, path_format, name_format)
+
+
+###############################################################################
+def vprint_formatter(*args, **kwargs):
+    """Verbose-enabled print formatter."""
+    if 'use_prefix' in kwargs:
+        use_prefix = kwargs['use_prefix']
+        del(kwargs['use_prefix'])
+    else:
+        use_prefix = True
+
+    if use_prefix:
+        print(OUTPUT_PREFIX, 'VERBOSE:', *args, **kwargs)
+    else:
+        print(*args, **kwargs)
+
+
+def vprint_formatter_void(*args, **kwargs):
+    """Verbose-disabled print formatter."""
+    pass
+
+
+def myformatwarning(message, category, filename, lineno, line=None):
+    return '{} WARNING: {}\n'.format(OUTPUT_PREFIX, str(message))
+
+
+###############################################################################
+def disk_usage(path):
+    """
+    Return percentual amount of disk space used on the file system containing
+    given path.
+
+    statvfs.f_blocks is size of fs in f_frsize units
+    statvfs.f_bavail is number of free blocks for unprivileged users
+    """
+
+    statvfs = os.statvfs(path)
+    used_blocks = statvfs.f_blocks - statvfs.f_bavail
+    used_perc = used_blocks / statvfs.f_blocks * 100.0
+    return used_perc
+
+
+def dir_scan(path, vprefix):
+    """
+    Wrapper for Path.iterdir(), which returns list containing only directories,
+    ignores hidden files, and uses vprint().
+    """
+    ret = []
+    vprint('{} directory "{}" scan:'.format(vprefix, path.name))
+    for file in path.iterdir():
+        if not file.is_dir():
+            vprint('\tignoring "{}", not a directory'.format(file.name))
+        elif file.name.startswith('.'):
+            vprint('\tignoring hidden directory "{}"'.format(file.name))
+        else:
+            vprint('\tfound directory "{}"'.format(file.name))
+            ret.append(file)
+    return ret
+
+
+def dir_is_empty(path):
+    return not any(True for _ in path.iterdir())
+
+
+def min_all(iterable, selector):
+        """Return list of all smallest items in an iterable."""
+        smallest = min(iterable, key=selector)
+        smallest_selected = selector(smallest)
+        return [i for i in iterable if selector(i) == smallest_selected]
+
+
+###############################################################################
+if __name__ == "__main__":
+    # set my format for warning print function
+    warnings.formatwarning = myformatwarning
+
+    ########################################
+    # parse command line arguments
+    parser = argparse.ArgumentParser(
+        description='Data manager.',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+    parser.add_argument('-u', '--du-upper-bound',
+                        dest='du_upper_bound',
+                        type=float,
+                        default=90.0,
+                        help='Percentual upper bound of disk usage.')
+    parser.add_argument('-l', '--du-lower-bound',
+                        dest='du_lower_bound',
+                        type=float,
+                        default=None,
+                        help='Percentual lower bound of disk usage.')
+    parser.add_argument('-n', '--dry-run',
+                        dest='dry_run',
+                        action='store_true',
+                        default=False,
+                        help='Don\'t actually remove anything, just show what '
+                             'would be done.')
+    parser.add_argument('-v', '--verbose',
+                        dest='verbose',
+                        action='store_true',
+                        default=False,
+                        help='Be verbose.')
+
+    parser.add_argument('base_path',
+                        nargs=1,
+                        help='Path to the flow storage directory.')
+    args = parser.parse_args()
+
+    ########################################
+    # validate and handle command line arguments
+    # define verbose print function
+    vprint = vprint_formatter if args.verbose else vprint_formatter_void
+
+    # check validity of given bounds
+    if args.du_lower_bound and args.du_lower_bound > args.du_upper_bound:
+        raise ValueError('the lower bound is greater than the upper bound')
+    if (args.du_lower_bound and args.du_upper_bound - args.du_lower_bound >
+            DU_BOUND_DIFFERENCE_LIMIT):
+        raise ValueError('the lower and upper bound difference is dangerously '
+                         'large')
+    if args.du_upper_bound > DU_UPPER_BOUND_LIMIT:
+        raise ValueError('the upper bound is dangerously high')
+    if args.du_lower_bound and args.du_lower_bound < DU_LOWER_BOUND_LIMIT:
+        raise ValueError('the lower bound is dangerously low')
+
+    # check validity of given base path
+    base_path = Path(args.base_path[0])
+    if not base_path.exists():
+        raise FileNotFoundError('"{}" does not exist'.format(base_path))
+    if not base_path.is_dir():
+        raise NotADirectoryError('"{}" does not point to a directory'
+                                 .format(base_path))
+
+    ########################################
+    # now do the real work
+    # check if used disk space is below the given upper bound
+    if disk_usage(base_path) < args.du_upper_bound:
+        vprint('nothing to do, used disk space is below the given upper bound,'
+               ' {0:.2f} < {1:.2f}'.format(disk_usage(base_path),
+                                           args.du_upper_bound))
+        exit(0)
+
+    # find node directories in the base path
+    node_dirs = dir_scan(base_path, 'base')
+    if not node_dirs:
+        raise Exception('node directory lookup: nothing appropriate found in '
+                        'the given directory')
+
+    # check if all node directories are placed on the same device
+    ref_st_dev = node_dirs[0].stat().st_dev
+    if not all(ref_st_dev == node_dir.stat().st_dev for node_dir in node_dirs):
+        raise Exception('node directory lookup: one or more node directories '
+                        'are placed on different devices')
+
+    nodes = []
+    for path in node_dirs:
+        node = Node(path)
+        node.scan()
+        nodes.append(node)
+
+    print(nodes)
+
+    all_channels = []
+    for node in nodes:
+        for profile in node.profiles:
+            all_channels = profile.get_channels(True)
+
+    earliest_channels = min_all(
+        all_channels, lambda channel: channel.get_earliest_flow_file())
+    for channel in earliest_channels:
+        channel.unlink_earliest_flow_file()
+
+    # if args.du_lower_bound:
+    #     vprint('lower bound defined, using hysteresis')
+    #     while disk_usage(base_path) > args.du_lower_bound:
+    #         delete_earliest(node_dirs)
+    # else:
+    #     vprint('lower bound not defined, removing only the oldest day')
+    #     delete_earliest(node_dirs)
