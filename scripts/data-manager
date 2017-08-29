@@ -401,6 +401,7 @@ def disk_usage(path, output='percentual'):
     statvfs.f_bavail is number of free blocks for unprivileged users
     """
 
+    path = str(path)  # for backward compatibility with Python < 3.6
     statvfs = os.statvfs(path)
     used_blocks = statvfs.f_blocks - statvfs.f_bavail
     if output == 'blocks':
@@ -460,7 +461,8 @@ def unlink_earliest_files(channels):
 
     size_all = 0  # size of all unlinked files in bytes
     for channel in min_channels:
-        size_all += os.stat(channel.get_earliest_flow_file().path).st_size
+        # os.stat() does not accept a path-like object until Python 3.6
+        size_all += os.stat(str(channel.get_earliest_flow_file().path)).st_size
         channel.unlink_earliest_flow_file()
 
     du_after = (disk_usage(base_path, output='bytes'),
