@@ -38,6 +38,7 @@
 
 
 import os
+import sys
 import re
 import argparse
 import datetime
@@ -72,8 +73,8 @@ DATETIME_REGEX = re.compile(DATETIME_PATTERN, re.ASCII)
 class Node:
     """Representation of a node with multiple base profiles.
 
-    In the usual case, list of base profiles usualy contains just single base
-    profile called "live"
+    In the usual case, list of base profiles contains just a single base
+    profile called "live".
     """
 
     def __init__(self, path):
@@ -85,6 +86,12 @@ class Node:
                                                  self.path.name, self.profiles)
 
     def scan(self):
+        """Scan node's base directory and look for base profiles.
+
+        Scan node's base directory, look for profiles and eventually
+        recursively construct those profiles as instances of class Profile.
+        """
+
         self.profiles.clear()
 
         for profile_dir in dir_scan(self.path, 'node'):
@@ -94,13 +101,13 @@ class Node:
 
 
 class Profile:
-    """IPFIXcol (sub)profile representation."""
+    """IPFIXcol profile/subprofile representation."""
 
     def __init__(self, path, parent):
         self.path = path  # pathlib path to the profile's base directory
         self.parent = parent  # profile's parent Profile or Node
-        self.channels = []
-        self.subprofiles = []
+        self.channels = []  # list of instances of Channel
+        self.subprofiles = []  # list of instances of Profile
 
     def __repr__(self):
         return '{}(name={}, parent={}, channels={}, subprofiles={})'\
@@ -108,6 +115,14 @@ class Profile:
                     self.channels, self.subprofiles)
 
     def scan(self):
+        """Scan profile's base directory and look for channels and subprofiles.
+
+        Scan profile's base directory and look for for channels (directory
+        "channels"), ignore directory with RRD files "rrd", also ignore hidden
+        directories. All other directories are assumed to be subprofiles and
+        are recursively constructed as instances of class Profile.
+        """
+
         self.channels.clear()
         self.subprofiles.clear()
 
@@ -135,6 +150,8 @@ class Profile:
                             .format(self.path.name))
 
     def get_channels(self, recursively=False):
+        """Return a list of subprofiles, recursively or not."""
+
         channels = list(self.channels)  # make a copy
         if recursively:
             for subprofile in self.subprofiles:
@@ -147,7 +164,7 @@ class Profile:
         def __init__(self, path, parent):
             self.path = path  # pathlib path to the channel's base directory
             self.parent = parent  # channel's parent Profile
-            self.flow_files = []
+            self.flow_files = []  # list of instances of FlowFile
 
         def __repr__(self):
             return ('{}(name={}, parent={}, earliest_flow_file={}, '
@@ -157,25 +174,51 @@ class Profile:
                             self.get_earliest_flow_file(),
                             self.get_latest_flow_file()))
 
+        def is_empty(self):
+            return False if self.flow_files else True
+
         def get_earliest_flow_file(self):
-            return self.flow_files[0]
+            return self.flow_files[0] if not self.is_empty() else None
 
         def get_latest_flow_file(self):
-            return self.flow_files[-1]
+            return self.flow_files[-1] if not self.is_empty() else None
 
         def unlink_earliest_flow_file(self):
             if args.dry_run:
-                earliest = self.get_earliest_flow_file().path  # only retrieves
-                print('would unlink "{}"'.format(earliest))
+                earliest_ff = self.get_earliest_flow_file()  # only retrieves
+                print('would unlink "{}"'.format(earliest_ff.path))
             else:
-                earliest = self.flow_files.pop(0).path  # retrieves and removes
-                vprint('unlinking "{}"'.format(earliest))
-                earliest.unlink()
+                earliest_ff = self.flow_files.pop(0)  # retrieves and removes
+                vprint('unlinking "{}"'.format(earliest_ff.path))
+                earliest_ff.path.unlink()
+            self.remove_empty_parent_directories(earliest_ff)
 
-            # print('rmdir "{}"'.format(day_dir))
-            # day_dir.rmdir()
+        def remove_empty_parent_directories(self, flow_file):
+            """Only works with YYYY/MM/DD directory hierarchy."""
+
+            if flow_file.name_datetime.date() != flow_file.path_date:
+                warnings.warn('remove empty parent directories: "{}": '
+                              'path/name date mismatch, unable to remove '
+                              'empty directories'.format(flow_file.path))
+                return
+
+            parent_dir = flow_file.path.parent
+            for i in ['day', 'month', 'year']:
+                if dir_is_empty(parent_dir):
+                    if args.dry_run:
+                        print('would remove empty {} directory "{}"'
+                              .format(i, parent_dir))
+                    else:
+                        vprint('removing empty {} directory "{}"'
+                               .format(i, parent_dir))
+                        parent_dir.rmdir()
+                else:
+                    break
+                parent_dir = parent_dir.parent
 
         def scan(self):
+            """Scan channel's base directory and look for flow files."""
+
             self.flow_files.clear()
 
             for path in self.path.rglob('*'):
@@ -188,13 +231,13 @@ class Profile:
 
                 flow_file = self.FlowFile(path, self)
                 try:
-                    flow_file.scan()
+                    flow_file.parse_path()
                 except ValueError as e:
                     warnings.warn(e.args[0] + ', skipping')
                     continue
 
                 self.flow_files.append(flow_file)
-            self.flow_files.sort(key=lambda flow_file: flow_file.datetime)
+            self.flow_files.sort(key=lambda flow_file: flow_file.name_datetime)
 
         class FlowFile:
             """Flow file representation."""
@@ -202,80 +245,68 @@ class Profile:
             def __init__(self, path, parent):
                 self.path = path  # pathlib path to the file
                 self.parent = parent  # file's parent Channel
-                self.datetime = None
+                self.name_datetime = None
+                self.path_date = None
 
             def __repr__(self):
-                return ('{}(name={}, parent={}, datetime={})'
-                        .format(type(self).__name__, self.path.name,
-                                self.parent.path.name, self.datetime))
+                return ('{}(name={}, parent={}, name_datetime={}, '
+                        'path_date={})'.format(type(self).__name__,
+                                               self.path.name,
+                                               self.parent.path.name,
+                                               self.name_datetime,
+                                               self.path_date))
 
             def __lt__(self, other):
-                return self.datetime < other.datetime
+                return self.name_datetime < other.name_datetime
 
             def __le__(self, other):
-                return self.datetime <= other.datetime
+                return self.name_datetime <= other.name_datetime
 
             def __eq__(self, other):
-                return self.datetime == other.datetime
+                return self.name_datetime == other.name_datetime
 
             def __gt__(self, other):
-                return self.datetime > other.datetime
+                return self.name_datetime > other.name_datetime
 
             def __ge__(self, other):
-                return self.datetime >= other.datetime
+                return self.name_datetime >= other.name_datetime
 
-            def scan(self):
-                """
-                Lookup YYYYMMDDHHMM or YYYYMMDDHHMMSS pattern in the supplied
-                file name and return a corresponding datetime object.
+            def parse_path(self):
+                """Discover date and time from file's path.
+
+                Search for patterns YYYYMMDDHHMM or YYYYMMDDHHMMSS in the
+                file's name and if found, convert the match into corresponding
+                datetime object. Then check if file's directory hierarchy
+                comply with YYYY/MM/DD format.
                 """
 
                 match = DATETIME_REGEX.search(self.path.name)
                 if not match:
-                    raise ValueError('flow file scan: patterns YYYYMMDDHHMM '
-                                     'or YYYYMMDDHHMMSS not found in file\'s '
-                                     '"{}" name'.format(self.path))
+                    raise ValueError('flow file parse path: patterns '
+                                     'YYYYMMDDHHMM or YYYYMMDDHHMMSS not '
+                                     'found in file\'s "{}" name'
+                                     .format(self.path))
 
                 if match.group('second'):
                     strtime_format = STRTIME_FORMAT_YMDHMS
                 else:
                     strtime_format = STRTIME_FORMAT_YMDHM
-                self.datetime = datetime.datetime.strptime(match.group(0),
-                                                           strtime_format)
-
-            # def detect_path_format(self, path):
-            #     """
-            #     Just a heuristic which searches for YYYYMMDDHHMM or
-            #     YYYYMMDDHHMMSS pattern in supplied paths's name.
-            #     """
-
-            #     match = re.search(pattern, path.name, re.ASCII)
-            #     if not match:
-            #         raise Exception('channel storage hierarchy detection: "{}": '
-            #                         'pattern YYYYMMDDHHMM or YYYYMMDDHHMMSS not '
-            #                         'found in file\'s name'.format(path))
-
-            #     # construct file name format suitable for strftime()
-            #     name_format  = path.name[:match.start()]
-            #     name_format += (self.strtime_dict['year']
-            #                     + self.strtime_dict['month']
-            #                     + self.strtime_dict['day']
-            #                     + self.strtime_dict['hour']
-            #                     + self.strtime_dict['minute'])
-            #     if match.group('second'):
-            #         name_format += self.strtime_dict['second']
-            #     name_format += path.name[match.end():]
-
-            #     # construct path format suitable for strftime()
-            #     path_format = str(path.parent.relative_to(self.path))
-            #     for key in ['year', 'month', 'day', 'hour', 'minute', 'second']:
-            #         if not match.group(key):
-            #             continue
-            #         path_format = path_format.replace(match.group(key),
-            #                 self.strtime_dict[key], 1)
-
-            #     # join together channel's base path, path format and name format
-            #     self.path_format = Path(self.path, path_format, name_format)
+                self.name_datetime = datetime.datetime.strptime(match.group(0),
+                                                                strtime_format)
+                try:
+                    day = int(self.path.parent.name)
+                    month = int(self.path.parent.parent.name)
+                    year = int(self.path.parent.parent.parent.name)
+                    self.path_date = datetime.date(year, month, day)
+                except Exception:
+                    warnings.warn('flow file parse path: "{}" does not comply '
+                                  'with YYYY/MM/DD directory hierarchy'
+                                  .format(self.path))
+                if self.name_datetime.date() != self.path_date:
+                    warnings.warn('flow file parse path: path/name date '
+                                  'mismatch, name corresponds to "{}", path '
+                                  'corresponds to "{}"'
+                                  .format(self.name_datetime, self.path_date))
 
 
 ###############################################################################
@@ -303,10 +334,68 @@ def myformatwarning(message, category, filename, lineno, line=None):
 
 
 ###############################################################################
-def disk_usage(path):
+def main():
+    rc = 0
+
+    # check if used disk space is below the given upper bound
+    du_before = disk_usage(base_path, output='percentual')
+    if du_before < args.du_upper_bound:
+        vprint('nothing to do, used disk space is below the given upper bound '
+               '({:.2f} % < {:.2f} %)'.format(du_before, args.du_upper_bound))
+        return 0
+
+    # find node directories in the base path
+    node_dirs = dir_scan(base_path, 'base')
+    if not node_dirs:
+        raise Exception('node directory lookup: nothing appropriate found in '
+                        'the given directory')
+
+    # check if all node directories are placed on the same device
+    ref_st_dev = node_dirs[0].stat().st_dev
+    if not all(ref_st_dev == node_dir.stat().st_dev for node_dir in node_dirs):
+        raise Exception('node directory lookup: one or more node directories '
+                        'are placed on different devices')
+
+    # scan all node directories and create profiles, recursively
+    nodes = []
+    for path in node_dirs:
+        node = Node(path)
+        node.scan()
+        nodes.append(node)
+
+    # get list of all channels, recursively
+    all_channels = []
+    for node in nodes:
+        for profile in node.profiles:
+            all_channels += profile.get_channels(recursively=True)
+
+    total_unlinked = 0
+    if args.du_lower_bound:
+        vprint('lower bound defined, using hysteresis')
+        while disk_usage(base_path) > args.du_lower_bound:
+            unlinked = unlink_earliest_files(all_channels)
+            if unlinked == 0:
+                warnings.warn('all channels are empty, cannot reach lower '
+                              'bound')
+                rc = 1
+            total_unlinked += unlinked
+    else:
+        vprint('lower bound not defined, removing only the oldest files')
+        total_unlinked = unlink_earliest_files(all_channels)
+        if total_unlinked == 0:
+            warnings.warn('all channels are empty, nothing to do')
+
+    du_after = disk_usage(base_path, output='percentual')
+    vprint('summary: unlinked {} files, disk usage went from {:.2f} % to '
+           '{:.2f} %'.format(total_unlinked, du_before, du_after))
+
+    return rc
+
+
+def disk_usage(path, output='percentual'):
     """
-    Return percentual amount of disk space used on the file system containing
-    given path.
+    Return the amount of disk space used on the file system containing given
+    path.
 
     statvfs.f_blocks is size of fs in f_frsize units
     statvfs.f_bavail is number of free blocks for unprivileged users
@@ -314,8 +403,15 @@ def disk_usage(path):
 
     statvfs = os.statvfs(path)
     used_blocks = statvfs.f_blocks - statvfs.f_bavail
-    used_perc = used_blocks / statvfs.f_blocks * 100.0
-    return used_perc
+    if output == 'blocks':
+        return used_blocks
+    elif output == 'bytes':
+        return used_blocks * statvfs.f_frsize
+    elif output == 'percentual':
+        return used_blocks / statvfs.f_blocks * 100.0
+    else:
+        raise ValueError('invalid value of output "{}", possible options are '
+                         'blocks, bytes, and percentual'.format(output))
 
 
 def dir_scan(path, vprefix):
@@ -347,6 +443,40 @@ def min_all(iterable, selector):
         return [i for i in iterable if selector(i) == smallest_selected]
 
 
+def unlink_earliest_files(channels):
+    non_empty_channels = [ch for ch in channels if not ch.is_empty()]
+    if not non_empty_channels:
+        return 0
+
+    min_channels = min_all(non_empty_channels, lambda channel:
+                           channel.get_earliest_flow_file())
+
+    vprint('going to unlink {} files from {}'
+           .format(len(min_channels),
+                   min_channels[0].get_earliest_flow_file().name_datetime))
+
+    du_before = (disk_usage(base_path, output='bytes'),
+                 disk_usage(base_path, output='percentual'))
+
+    size_all = 0  # size of all unlinked files in bytes
+    for channel in min_channels:
+        size_all += os.stat(channel.get_earliest_flow_file().path).st_size
+        channel.unlink_earliest_flow_file()
+
+    du_after = (disk_usage(base_path, output='bytes'),
+                disk_usage(base_path, output='percentual'))
+    vprint('used disk space in bytes: '
+           'before = {} ({:.2f} %), '
+           'after = {} ({:.2f} %), '
+           'difference = {}, '
+           'unlinked files\' size = {}'
+           .format(du_before[0], du_before[1],
+                   du_after[0], du_after[1],
+                   abs(du_before[0] - du_after[0]),
+                   size_all))
+    return len(min_channels)
+
+
 ###############################################################################
 if __name__ == "__main__":
     # set my format for warning print function
@@ -355,7 +485,7 @@ if __name__ == "__main__":
     ########################################
     # parse command line arguments
     parser = argparse.ArgumentParser(
-        description='Data manager.',
+        description='Flow file data manager.',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     parser.add_argument('-u', '--du-upper-bound',
@@ -411,48 +541,5 @@ if __name__ == "__main__":
                                  .format(base_path))
 
     ########################################
-    # now do the real work
-    # check if used disk space is below the given upper bound
-    if disk_usage(base_path) < args.du_upper_bound:
-        vprint('nothing to do, used disk space is below the given upper bound,'
-               ' {0:.2f} < {1:.2f}'.format(disk_usage(base_path),
-                                           args.du_upper_bound))
-        exit(0)
-
-    # find node directories in the base path
-    node_dirs = dir_scan(base_path, 'base')
-    if not node_dirs:
-        raise Exception('node directory lookup: nothing appropriate found in '
-                        'the given directory')
-
-    # check if all node directories are placed on the same device
-    ref_st_dev = node_dirs[0].stat().st_dev
-    if not all(ref_st_dev == node_dir.stat().st_dev for node_dir in node_dirs):
-        raise Exception('node directory lookup: one or more node directories '
-                        'are placed on different devices')
-
-    nodes = []
-    for path in node_dirs:
-        node = Node(path)
-        node.scan()
-        nodes.append(node)
-
-    print(nodes)
-
-    all_channels = []
-    for node in nodes:
-        for profile in node.profiles:
-            all_channels = profile.get_channels(True)
-
-    earliest_channels = min_all(
-        all_channels, lambda channel: channel.get_earliest_flow_file())
-    for channel in earliest_channels:
-        channel.unlink_earliest_flow_file()
-
-    # if args.du_lower_bound:
-    #     vprint('lower bound defined, using hysteresis')
-    #     while disk_usage(base_path) > args.du_lower_bound:
-    #         delete_earliest(node_dirs)
-    # else:
-    #     vprint('lower bound not defined, removing only the oldest day')
-    #     delete_earliest(node_dirs)
+    # do the real work
+    sys.exit(main())
