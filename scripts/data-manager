@@ -40,6 +40,7 @@
 import os
 import sys
 import re
+import math
 import argparse
 import datetime
 import warnings
@@ -67,6 +68,9 @@ DATETIME_PATTERN = (r'(?P<year>\d{4})(?P<month>\d{2})(?P<day>\d{2})'
                     r'(?P<second>\d{2})?')
 # precompiled regex for YYYYMMDDHHMM or YYYYMMDDHHMMSS
 DATETIME_REGEX = re.compile(DATETIME_PATTERN, re.ASCII)
+
+# metric prefixes for int_prefix()
+METRIC_PREFIXES = 'kMGTPEZYyzafpnµm'
 
 
 ###############################################################################
@@ -338,10 +342,11 @@ def main():
     rc = 0
 
     # check if used disk space is below the given upper bound
-    du_before = disk_usage(base_path, output='percentual')
-    if du_before < args.du_upper_bound:
+    du_before = disk_usage(base_path)
+    if du_before[2] < args.du_upper_bound:
         vprint('nothing to do, used disk space is below the given upper bound '
-               '({:.2f} % < {:.2f} %)'.format(du_before, args.du_upper_bound))
+               '({:.2f} % < {:.2f} %)'.format(du_before[2],
+                                              args.du_upper_bound))
         return 0
 
     # find node directories in the base path
@@ -372,12 +377,14 @@ def main():
     total_unlinked = 0
     if args.du_lower_bound:
         vprint('lower bound defined, using hysteresis')
-        while disk_usage(base_path) > args.du_lower_bound:
+        while disk_usage(base_path)[2] > args.du_lower_bound:
             unlinked = unlink_earliest_files(all_channels)
             if unlinked == 0:
                 warnings.warn('all channels are empty, cannot reach lower '
-                              'bound')
+                              'bound of disk usage ({:.2f})'
+                              .format(args.du_lower_bound))
                 rc = 1
+                break
             total_unlinked += unlinked
     else:
         vprint('lower bound not defined, removing only the oldest files')
@@ -385,14 +392,20 @@ def main():
         if total_unlinked == 0:
             warnings.warn('all channels are empty, nothing to do')
 
-    du_after = disk_usage(base_path, output='percentual')
-    vprint('summary: unlinked {} files, disk usage went from {:.2f} % to '
-           '{:.2f} %'.format(total_unlinked, du_before, du_after))
-
+    du_after = disk_usage(base_path)
+    vprint('summary: unlinked {} files, used disk space '
+           'before = {} ({:.2f} %), '
+           'after = {} ({:.2f} %), '
+           'difference = {}, '
+           .format(total_unlinked,
+                   int_prefix_str(du_before[1], '{:.2f} {}B'), du_before[2],
+                   int_prefix_str(du_after[1], '{:.2f} {}B'), du_after[2],
+                   int_prefix_str(abs(du_before[1] - du_after[1]),
+                                  '{:.2f} {}B')))
     return rc
 
 
-def disk_usage(path, output='percentual'):
+def disk_usage(path):
     """
     Return the amount of disk space used on the file system containing given
     path.
@@ -404,15 +417,10 @@ def disk_usage(path, output='percentual'):
     path = str(path)  # for backward compatibility with Python < 3.6
     statvfs = os.statvfs(path)
     used_blocks = statvfs.f_blocks - statvfs.f_bavail
-    if output == 'blocks':
-        return used_blocks
-    elif output == 'bytes':
-        return used_blocks * statvfs.f_frsize
-    elif output == 'percentual':
-        return used_blocks / statvfs.f_blocks * 100.0
-    else:
-        raise ValueError('invalid value of output "{}", possible options are '
-                         'blocks, bytes, and percentual'.format(output))
+
+    # (block, bytes, percentual)
+    return (used_blocks, used_blocks * statvfs.f_frsize,
+            used_blocks / statvfs.f_blocks * 100.0)
 
 
 def dir_scan(path, vprefix):
@@ -456,8 +464,7 @@ def unlink_earliest_files(channels):
            .format(len(min_channels),
                    min_channels[0].get_earliest_flow_file().name_datetime))
 
-    du_before = (disk_usage(base_path, output='bytes'),
-                 disk_usage(base_path, output='percentual'))
+    du_before = disk_usage(base_path)
 
     size_all = 0  # size of all unlinked files in bytes
     for channel in min_channels:
@@ -465,18 +472,37 @@ def unlink_earliest_files(channels):
         size_all += os.stat(str(channel.get_earliest_flow_file().path)).st_size
         channel.unlink_earliest_flow_file()
 
-    du_after = (disk_usage(base_path, output='bytes'),
-                disk_usage(base_path, output='percentual'))
-    vprint('used disk space in bytes: '
+    du_after = disk_usage(base_path)
+    vprint('used disk space '
            'before = {} ({:.2f} %), '
            'after = {} ({:.2f} %), '
            'difference = {}, '
            'unlinked files\' size = {}'
-           .format(du_before[0], du_before[1],
-                   du_after[0], du_after[1],
-                   abs(du_before[0] - du_after[0]),
-                   size_all))
+           .format(int_prefix_str(du_before[1], '{:.2f} {}B'), du_before[2],
+                   int_prefix_str(du_after[1], '{:.2f} {}B'), du_after[2],
+                   int_prefix_str(abs(du_before[1] - du_after[1]),
+                                  '{:.2f} {}B'),
+                   int_prefix_str(size_all, '{:.2f} {}B')))
     return len(min_channels)
+
+
+def int_prefix(num):
+    num = int(num)
+    if abs(num) < 1000:
+        return (num, None)
+
+    order = math.floor(math.log10(abs(num)))
+    div, mod = divmod(order, 3)
+    new_num = num * (10 ** (-order + mod))
+    return (new_num, METRIC_PREFIXES[div - 1])
+
+
+def int_prefix_str(num, format_string='{0} {1}'):
+    new_num, prefix = int_prefix(num)
+    if prefix:
+        return format_string.format(new_num, prefix)
+    else:
+        return str(num)
 
 
 ###############################################################################
