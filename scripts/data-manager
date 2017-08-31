@@ -98,7 +98,12 @@ class Node:
 
         self.profiles.clear()
 
-        for profile_dir in dir_scan(self.path, 'node'):
+        vprint('node directory "{}" scan:'.format(self.path.name), end=' ')
+        content_dict = dir_scan(self.path)
+        vprint('using dirs: {}, ignoring: {}'
+               .format(content_dict['dirs_n'], content_dict['others_n']),
+               use_prefix=False)
+        for profile_dir in content_dict['dirs']:
             profile = Profile(profile_dir, self)
             profile.scan()
             self.profiles.append(profile)
@@ -130,28 +135,49 @@ class Profile:
         self.channels.clear()
         self.subprofiles.clear()
 
-        # subprofiles and channels are alphabetically sorted due to lists
-        # equality comaprison
-        for subdir in sorted(dir_scan(self.path, 'profile')):
-            vprint('profile "{}":'.format(self.path.name), end=' ')
-            if subdir.name == 'channels':
-                vprint('adding channels', use_prefix=False)
-                for channel_dir in sorted(dir_scan(subdir, 'profile/channel')):
-                    channel = self.Channel(channel_dir, self)
-                    channel.scan()
-                    self.channels.append(channel)
-            elif subdir.name == 'rrd':
-                vprint('ignoring RRD directory', use_prefix=False)
+        vprint('profile directory "{}" scan:'.format(self.path.name), end=' ')
+        content_dict = dir_scan(self.path)
+        # further separate found directories into channels directory, rrd
+        # directory, and other directories == subprofile directories
+        for subdir in content_dict['dirs']:
+            if subdir.name == 'channels' or subdir.name == 'rrd':
+                content_dict[subdir.name + '_dir'] = subdir
+                content_dict[subdir.name + '_dir_n'] = subdir.name
             else:
-                vprint('adding subprofile "{}"'.format(subdir.name),
-                       use_prefix=False)
-                profile = Profile(subdir, self)
-                profile.scan()
-                self.subprofiles.append(profile)
+                content_dict.setdefault('subprofile_dirs', set()).add(subdir)
+                content_dict.setdefault('subprofile_dirs_n', set()).add(
+                    subdir.name)
+        content_dict.setdefault('subprofile_dirs', set())
+        content_dict.setdefault('subprofile_dirs_n')
+        content_dict.setdefault('rrd_dir')
+        content_dict.setdefault('rrd_dir_n')
 
-        if not self.channels:
+        if 'channels_dir' not in content_dict:
             raise Exception('profile "{}" is missing the "channels" directory'
                             .format(self.path.name))
+        vprint('channels dir: {}, RRD dir: {}, subprofiles list: {}, '
+               'ignoring files: {}'.format(content_dict['channels_dir_n'],
+                                           content_dict['rrd_dir_n'],
+                                           content_dict['subprofile_dirs_n'],
+                                           content_dict['others_n']),
+               use_prefix=False)
+
+        # scan channels directory
+        vprint('channels directory "{}" scan:'
+               .format(content_dict['channels_dir'].name), end=' ')
+        ch_content_dict = dir_scan(content_dict['channels_dir'])
+        vprint('using dirs: {}, ignoring files: {}'
+               .format(ch_content_dict['dirs_n'], ch_content_dict['others_n']),
+               use_prefix=False)
+        for channel_dir in ch_content_dict['dirs']:
+            channel = self.Channel(channel_dir, self)
+            channel.scan()
+            self.channels.append(channel)
+
+        for subprofile_dir in content_dict['subprofile_dirs']:
+            subprofile = Profile(subprofile_dir, self)
+            subprofile.scan()
+            self.subprofiles.append(subprofile)
 
     def get_channels(self, recursively=False):
         """Return a list of subprofiles, recursively or not."""
@@ -225,7 +251,9 @@ class Profile:
 
             self.flow_files.clear()
 
-            for path in self.path.rglob('*'):
+            vprint('channel directory "{}" scan:'.format(self.path.name),
+                   end=' ')
+            for path in self.path.rglob('*'):  # recursively list all files
                 if not path.is_file():
                     continue
                 elif path.name.startswith('.'):
@@ -242,6 +270,15 @@ class Profile:
 
                 self.flow_files.append(flow_file)
             self.flow_files.sort(key=lambda flow_file: flow_file.name_datetime)
+
+            if self.flow_files:
+                vprint('found {} flow files, earliest from {}, latest from {}'
+                       .format(len(self.flow_files),
+                               self.get_earliest_flow_file().name_datetime,
+                               self.get_latest_flow_file().name_datetime),
+                       use_prefix=False)
+            else:
+                vprint('found 0 flow files', use_prefix=False)
 
         class FlowFile:
             """Flow file representation."""
@@ -350,20 +387,25 @@ def main():
         return 0
 
     # find node directories in the base path
-    node_dirs = dir_scan(base_path, 'base')
-    if not node_dirs:
+    vprint('base directory "{}" scan:'.format(base_path), end=' ')
+    content_dict = dir_scan(base_path)
+    vprint('using dirs: {}, ignoring files: {}'
+           .format(content_dict['dirs_n'], content_dict['others_n']),
+            use_prefix=False)
+    if not content_dict['dirs']:
         raise Exception('node directory lookup: nothing appropriate found in '
                         'the given directory')
 
     # check if all node directories are placed on the same device
-    ref_st_dev = node_dirs[0].stat().st_dev
-    if not all(ref_st_dev == node_dir.stat().st_dev for node_dir in node_dirs):
+    ref_st_dev = next(iter(content_dict['dirs'])).stat().st_dev
+    if not all(ref_st_dev == node_dir.stat().st_dev
+               for node_dir in content_dict['dirs']):
         raise Exception('node directory lookup: one or more node directories '
                         'are placed on different devices')
 
     # scan all node directories and create profiles, recursively
     nodes = []
-    for path in node_dirs:
+    for path in content_dict['dirs']:
         node = Node(path)
         node.scan()
         nodes.append(node)
@@ -381,7 +423,7 @@ def main():
             unlinked = unlink_earliest_files(all_channels)
             if unlinked == 0:
                 warnings.warn('all channels are empty, cannot reach lower '
-                              'bound of disk usage ({:.2f})'
+                              'bound of disk usage ({:.2f} %)'
                               .format(args.du_lower_bound))
                 rc = 1
                 break
@@ -423,22 +465,26 @@ def disk_usage(path):
             used_blocks / statvfs.f_blocks * 100.0)
 
 
-def dir_scan(path, vprefix):
+def dir_scan(path):
     """
-    Wrapper for Path.iterdir(), which returns list containing only directories,
-    ignores hidden files, and uses vprint().
+    Wrapper for Path.iterdir(), which returns dictionaty containing separate
+    sets for directories (keys dirs and dirs_n) and other content (keys
+    others and others_n).
     """
-    ret = []
-    vprint('{} directory "{}" scan:'.format(vprefix, path.name))
+    dir_content = {}
     for file in path.iterdir():
-        if not file.is_dir():
-            vprint('\tignoring "{}", not a directory'.format(file.name))
-        elif file.name.startswith('.'):
-            vprint('\tignoring hidden directory "{}"'.format(file.name))
+        if not file.is_dir() or file.name.startswith('.'):
+            dir_content.setdefault('others', set()).add(file)
+            dir_content.setdefault('others_n', set()).add(file.name)
         else:
-            vprint('\tfound directory "{}"'.format(file.name))
-            ret.append(file)
-    return ret
+            dir_content.setdefault('dirs', set()).add(file)
+            dir_content.setdefault('dirs_n', set()).add(file.name)
+
+    dir_content.setdefault('dirs')
+    dir_content.setdefault('dirs_n')
+    dir_content.setdefault('others')
+    dir_content.setdefault('others_n')
+    return dir_content
 
 
 def dir_is_empty(path):
