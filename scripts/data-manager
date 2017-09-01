@@ -213,16 +213,6 @@ class Profile:
         def get_latest_flow_file(self):
             return self.flow_files[-1] if not self.is_empty() else None
 
-        def unlink_earliest_flow_file(self):
-            if args.dry_run:
-                earliest_ff = self.get_earliest_flow_file()  # only retrieves
-                print('would unlink "{}"'.format(earliest_ff.path))
-            else:
-                earliest_ff = self.flow_files.pop(0)  # retrieves and removes
-                vprint('unlinking "{}"'.format(earliest_ff.path))
-                earliest_ff.path.unlink()
-            self.remove_empty_parent_directories(earliest_ff)
-
         def remove_empty_parent_directories(self, flow_file):
             """Only works with YYYY/MM/DD directory hierarchy."""
 
@@ -236,8 +226,8 @@ class Profile:
             for i in ['day', 'month', 'year']:
                 if dir_is_empty(parent_dir):
                     if args.dry_run:
-                        print('would remove empty {} directory "{}"'
-                              .format(i, parent_dir))
+                        dprint('would remove empty {} directory "{}"'
+                               .format(i, parent_dir))
                     else:
                         vprint('removing empty {} directory "{}"'
                                .format(i, parent_dir))
@@ -288,6 +278,8 @@ class Profile:
                 self.parent = parent  # file's parent Channel
                 self.name_datetime = None
                 self.path_date = None
+
+                self._size = None  # never use directly, always use get_size()
 
             def __repr__(self):
                 return ('{}(name={}, parent={}, name_datetime={}, '
@@ -349,6 +341,24 @@ class Profile:
                                   'corresponds to "{}"'
                                   .format(self.name_datetime, self.path_date))
 
+            def get_size(self):
+                """Return size of the flow file in bytes. Lazy."""
+
+                if not self.path.exists():
+                    raise FileNotFoundError
+                elif not self._size:
+                    self._size = os.stat(str(self.path)).st_size
+                return self._size
+
+            def unlink(self):
+                if args.dry_run:
+                    dprint('would unlink "{}" of {}B'
+                           .format(self.path, int_prefix_str(self.get_size())))
+                else:
+                    vprint('unlinking "{}" of {}B'
+                           .format(self.path, int_prefix_str(self.get_size())))
+                    self.path.unlink()
+
 
 ###############################################################################
 def vprint_formatter(*args, **kwargs):
@@ -391,7 +401,7 @@ def main():
     content_dict = dir_scan(base_path)
     vprint('using dirs: {}, ignoring files: {}'
            .format(content_dict['dirs_n'], content_dict['others_n']),
-            use_prefix=False)
+           use_prefix=False)
     if not content_dict['dirs']:
         raise Exception('node directory lookup: nothing appropriate found in '
                         'the given directory')
@@ -416,34 +426,39 @@ def main():
         for profile in node.profiles:
             all_channels += profile.get_channels(recursively=True)
 
-    total_unlinked = 0
+    files_cnt = 0
+    columns_cnt = 0
+    bytes_cnt = 0
     if args.du_lower_bound:
-        vprint('lower bound defined, using hysteresis')
-        while disk_usage(base_path)[2] > args.du_lower_bound:
-            unlinked = unlink_earliest_files(all_channels)
-            if unlinked == 0:
-                warnings.warn('all channels are empty, cannot reach lower '
-                              'bound of disk usage ({:.2f} %)'
-                              .format(args.du_lower_bound))
-                rc = 1
-                break
-            total_unlinked += unlinked
+        # calculate difference between current disk usage and desired disk
+        # usage (aka lower bound) in bytes
+        statvfs = os.statvfs(str(path))
+        used_blocks = statvfs.f_blocks - statvfs.f_bavail
+        desired_blocks = int(statvfs.f_blocks * (args.du_lower_bound / 100.0))
+        bytes_cnt = (used_blocks - desired_blocks) * statvfs.f_frsize
     else:
-        vprint('lower bound not defined, removing only the oldest files')
-        total_unlinked = unlink_earliest_files(all_channels)
-        if total_unlinked == 0:
-            warnings.warn('all channels are empty, nothing to do')
+        files_cnt = 1
+
+    vprint('unlinking {} files, {} columns, {} bytes'.format(files_cnt,
+           columns_cnt, int_prefix_str(bytes_cnt)))
+    unlinked_files = unlink_earliest(all_channels, files_cnt=files_cnt,
+                                     columns_cnt=columns_cnt,
+                                     bytes_cnt=bytes_cnt)
+    if unlinked_files <= 0:
+        unlinked_files = -unlinked_files
+        warnings.warn('all channels are empty, cannot reach lower '
+                      'bound of disk usage ({:.2f} %)'
+                      .format(args.du_lower_bound))
 
     du_after = disk_usage(base_path)
-    vprint('summary: unlinked {} files, used disk space '
-           'before = {} ({:.2f} %), '
-           'after = {} ({:.2f} %), '
-           'difference = {}, '
-           .format(total_unlinked,
-                   int_prefix_str(du_before[1], '{:.2f} {}B'), du_before[2],
-                   int_prefix_str(du_after[1], '{:.2f} {}B'), du_after[2],
-                   int_prefix_str(abs(du_before[1] - du_after[1]),
-                                  '{:.2f} {}B')))
+    vprint('summary: {} {} files, used disk space '
+           'before = {}B ({:.2f} %), '
+           'after = {}B ({:.2f} %), '
+           'difference = {}B, '
+           .format('would unlink' if args.dry_run else 'unlinked',
+                   unlinked_files, int_prefix_str(du_before[1]), du_before[2],
+                   int_prefix_str(du_after[1]), du_after[2],
+                   int_prefix_str(abs(du_before[1] - du_after[1]))))
     return rc
 
 
@@ -498,38 +513,63 @@ def min_all(iterable, selector):
         return [i for i in iterable if selector(i) == smallest_selected]
 
 
-def unlink_earliest_files(channels):
-    non_empty_channels = [ch for ch in channels if not ch.is_empty()]
-    if not non_empty_channels:
-        return 0
+def unlink_earliest(channels, files_cnt=1, columns_cnt=0, bytes_cnt=0,
+                    alignment=datetime.timedelta(minutes=1)):
+    if not (files_cnt or columns_cnt or bytes_cnt):
+        raise ValueError('one of files_cnt, columns_cnt, or bytes_cnt has to '
+                         'be specified')
+    if files_cnt and files_cnt < 0:
+        raise ValueError('files_cnt has to be a positive integer')
+    if columns_cnt and columns_cnt < 0:
+        raise ValueError('columns_cnt has to be a positive integer')
+    if bytes_cnt and bytes_cnt < 0:
+        raise ValueError('bytes_cnt has to be a positive integer')
 
-    min_channels = min_all(non_empty_channels, lambda channel:
-                           channel.get_earliest_flow_file())
+    # get a sorted list (earlier first) of all flow files from all channels
+    all_files = []
+    for channel in channels:
+        all_files += channel.flow_files
+    all_files.sort()
 
-    vprint('going to unlink {} files from {}'
-           .format(len(min_channels),
-                   min_channels[0].get_earliest_flow_file().name_datetime))
+    # regular removal
+    unlinked_files = 0  # number of unlinked files
+    unlinked_columns = 0  # number of unlinked columns of files
+    unlinked_bytes = 0  # size of all unlinked files in bytes
+    while all_files:
+        if ((files_cnt and unlinked_files == files_cnt)
+                or (columns_cnt and unlinked_columns == columns_cnt)
+                or (bytes_cnt and unlinked_bytes >= bytes_cnt)):
+            break
+        flow_file = all_files.pop(0)  # retireve and remove
+        unlinked_files += 1
+        unlinked_columns += (flow_file.name_datetime !=
+                             next(iter(all_files),
+                                  Profile.Channel.FlowFile(None, None))
+                             .name_datetime)
+        unlinked_bytes += flow_file.get_size()
+        flow_file.unlink()
+        print('regular: ', unlinked_files, unlinked_columns, unlinked_bytes)
 
-    du_before = disk_usage(base_path)
+    # removal due to alignment
+    ref_datetime = flow_file.name_datetime
+    while all_files and alignment:
+        delta = all_files[0].name_datetime - ref_datetime
+        if delta > alignment:
+            break
+        flow_file = all_files.pop(0)  # retireve and remove
+        unlinked_files += 1
+        unlinked_columns += (flow_file.name_datetime !=
+                             next(iter(all_files),
+                                  Profile.Channel.FlowFile(None, None))
+                             .name_datetime)
+        unlinked_bytes += flow_file.get_size()
+        flow_file.unlink()
+        print('alignment: ', unlinked_files, unlinked_columns, unlinked_bytes)
 
-    size_all = 0  # size of all unlinked files in bytes
-    for channel in min_channels:
-        # os.stat() does not accept a path-like object until Python 3.6
-        size_all += os.stat(str(channel.get_earliest_flow_file().path)).st_size
-        channel.unlink_earliest_flow_file()
-
-    du_after = disk_usage(base_path)
-    vprint('used disk space '
-           'before = {} ({:.2f} %), '
-           'after = {} ({:.2f} %), '
-           'difference = {}, '
-           'unlinked files\' size = {}'
-           .format(int_prefix_str(du_before[1], '{:.2f} {}B'), du_before[2],
-                   int_prefix_str(du_after[1], '{:.2f} {}B'), du_after[2],
-                   int_prefix_str(abs(du_before[1] - du_after[1]),
-                                  '{:.2f} {}B'),
-                   int_prefix_str(size_all, '{:.2f} {}B')))
-    return len(min_channels)
+    if unlinked_bytes < bytes_cnt:
+        return -unlinked_files  # could not reach lower bound
+    else:
+        return unlinked_files  # lower bound reached
 
 
 def int_prefix(num):
@@ -543,12 +583,12 @@ def int_prefix(num):
     return (new_num, METRIC_PREFIXES[div - 1])
 
 
-def int_prefix_str(num, format_string='{0} {1}'):
+def int_prefix_str(num, format_string='{0:.2f} {1}'):
     new_num, prefix = int_prefix(num)
     if prefix:
         return format_string.format(new_num, prefix)
     else:
-        return str(num)
+        return str(num) + ' '
 
 
 ###############################################################################
@@ -591,8 +631,9 @@ if __name__ == "__main__":
 
     ########################################
     # validate and handle command line arguments
-    # define verbose print function
+    # define a verbose print function and a dry run print function
     vprint = vprint_formatter if args.verbose else vprint_formatter_void
+    dprint = print
 
     # check validity of given bounds
     if args.du_lower_bound and args.du_lower_bound > args.du_upper_bound:
