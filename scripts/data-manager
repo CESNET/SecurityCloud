@@ -50,10 +50,6 @@ from pathlib import Path
 OUTPUT_PREFIX = os.path.basename(__file__).upper() if '__file__' in globals() \
     else 'DATA-MANAGER'
 
-DU_UPPER_BOUND_LIMIT = 95.0
-DU_LOWER_BOUND_LIMIT = 5.0
-DU_BOUND_DIFFERENCE_LIMIT = 10.0
-
 # strftime()/strptime() translation table
 STRTIME_DICT = {'year': '%Y', 'month': '%m', 'day': '%d', 'hour': '%H',
                 'minute': '%M', 'second': '%S'}
@@ -360,6 +356,23 @@ class Profile:
                     self.path.unlink()
 
 
+class UnlinkedCounters:
+    def __init__(self):
+        self.files = 0  # number of unlinked files
+        self.columns = 0  # number of unlinked columns of files
+        self.bytes = 0  # size of all unlinked files in bytes
+
+    def __repr__(self):
+        return ('{}(files={}, columns={}, bytes={}'
+                .format(type(self).__name__, self.files, self.columns,
+                        self.bytes))
+
+    def add(self, other):
+        self.files += other.files
+        self.columns += other.columns
+        self.bytes += other.bytes
+
+
 ###############################################################################
 def vprint_formatter(*args, **kwargs):
     """Verbose-enabled print formatter."""
@@ -385,16 +398,47 @@ def myformatwarning(message, category, filename, lineno, line=None):
 
 
 ###############################################################################
-def main():
+def delete_main():
     rc = 0
 
     # check if used disk space is below the given upper bound
     du_before = disk_usage(base_path)
-    if du_before[2] < args.du_upper_bound:
-        vprint('nothing to do, used disk space is below the given upper bound '
-               '({:.2f} % < {:.2f} %)'.format(du_before[2],
-                                              args.du_upper_bound))
+    if du_before[2] < args.du_boundary:
+        vprint('nothing to do, used disk space ({:.2f} %) is below the disk '
+               'usage boundary ({:.2f} %)'.format(du_before[2],
+                                                  args.du_boundary))
         return 0
+
+    bytes_cnt_list = []
+    if args.bytes_cnt is not None:
+        bytes_cnt_list.append(args.bytes_cnt)
+    if args.du_lower_by is not None or args.du_lower_to is not None:
+        du_lower_list = []
+        if args.du_lower_by is not None:
+            diff_percent = du_before[2] - args.du_lower_by
+            du_lower_list.append(diff_percent if diff_percent > 0 else 0)
+        if args.du_lower_to is not None:
+            du_lower_list.append(args.du_lower_to)
+        max_du_lower_to = max(du_lower_list)
+
+        statvfs = os.statvfs(str(base_path))
+        now_used_blocks = statvfs.f_blocks - statvfs.f_bavail
+        des_used_blocks = statvfs.f_blocks * (max_du_lower_to / 100)
+        diff_blocks = now_used_blocks - des_used_blocks
+        if diff_blocks < 0:
+            vprint('nothing to do, used disk space ({:.2f} %) is below the '
+                   'target disk usage ({:.2f} %)'.format(du_before[2],
+                                                         max_du_lower_to))
+            return 0
+        else:
+            bytes_cnt_list.append(diff_blocks * statvfs.f_frsize)
+    min_bytes_cnt = min(bytes_cnt_list) if bytes_cnt_list else None
+
+    vprint('going to unlink {} files, {} columns, {}B'
+           .format(args.files_cnt if args.files_cnt is not None else '?',
+                   args.columns_cnt if args.columns_cnt is not None else '?',
+                   int_prefix_str(min_bytes_cnt) if min_bytes_cnt is not None
+                   else '?'))
 
     # find node directories in the base path
     vprint('base directory "{}" scan:'.format(base_path), end=' ')
@@ -420,46 +464,192 @@ def main():
         node.scan()
         nodes.append(node)
 
-    # get list of all channels, recursively
-    all_channels = []
+    # get a sorted list (earliest first) of all flow files from all channels
+    all_files = []
     for node in nodes:
         for profile in node.profiles:
-            all_channels += profile.get_channels(recursively=True)
+            for channel in profile.get_channels(recursively=True):
+                all_files += channel.flow_files
+    all_files.sort()
 
-    files_cnt = 0
-    columns_cnt = 0
-    bytes_cnt = 0
-    if args.du_lower_bound:
-        # calculate difference between current disk usage and desired disk
-        # usage (aka lower bound) in bytes
-        statvfs = os.statvfs(str(path))
-        used_blocks = statvfs.f_blocks - statvfs.f_bavail
-        desired_blocks = int(statvfs.f_blocks * (args.du_lower_bound / 100.0))
-        bytes_cnt = (used_blocks - desired_blocks) * statvfs.f_frsize
-    else:
-        files_cnt = 1
+    target_reached, aligned, counters = unlink_earliest(
+            all_files, files_cnt=args.files_cnt, columns_cnt=args.columns_cnt,
+            bytes_cnt=min_bytes_cnt)
+    if not target_reached:
+        warnings.warn('all files {} unlinked without reaching any of the stop '
+                      'conditions'
+                      .format('would be' if args.dry_run else 'were'))
 
-    vprint('unlinking {} files, {} columns, {} bytes'.format(files_cnt,
-           columns_cnt, int_prefix_str(bytes_cnt)))
-    unlinked_files = unlink_earliest(all_channels, files_cnt=files_cnt,
-                                     columns_cnt=columns_cnt,
-                                     bytes_cnt=bytes_cnt)
-    if unlinked_files <= 0:
-        unlinked_files = -unlinked_files
-        warnings.warn('all channels are empty, cannot reach lower '
-                      'bound of disk usage ({:.2f} %)'
-                      .format(args.du_lower_bound))
+    # align only if it was requested and if at least one file was unlinked
+    if args.align_to and counters.files:
+        if aligned:
+            vprint('already aligned')
+        else:
+            vprint('aligning to {}'.format(args.align_to))
+            alignment_counters = align_column(all_files, args.align_to)
+            counters.add(alignment_counters)
 
     du_after = disk_usage(base_path)
-    vprint('summary: {} {} files, used disk space '
-           'before = {}B ({:.2f} %), '
-           'after = {}B ({:.2f} %), '
-           'difference = {}B, '
-           .format('would unlink' if args.dry_run else 'unlinked',
-                   unlinked_files, int_prefix_str(du_before[1]), du_before[2],
-                   int_prefix_str(du_after[1]), du_after[2],
-                   int_prefix_str(abs(du_before[1] - du_after[1]))))
+    print('delete summary: {} {} files, {} columns, {}B'
+          .format('would unlink' if args.dry_run else 'unlinked',
+                  counters.files, counters.columns,
+                  int_prefix_str(counters.bytes)))
+    print('disk usage summary: '
+          'before: {}B ({:.2f} %), '
+          'after: {}B ({:.2f} %), '
+          'difference: {}B'
+          .format(int_prefix_str(du_before[1]), du_before[2],
+                  int_prefix_str(du_after[1]), du_after[2],
+                  int_prefix_str(abs(du_before[1] - du_after[1]))))
     return rc
+
+
+def delete_add_parser(subparsers):
+    parser = subparsers.add_parser('delete', help='delete help')
+    parser.set_defaults(func=delete_main)
+
+    parser.add_argument('-u', '--du-boundary',
+                        dest='du_boundary',
+                        type=argument_type_percent,
+                        default=90,
+                        help='Percentual upper boundary of disk usage: do '
+                             'nothing unless the current disk usage is '
+                             'greater than this value.')
+
+    parser.add_argument('--align-to',
+                        dest='align_to',
+                        choices=['second', 'minute', 'hour', 'day', 'month',
+                                 'year'],
+                        default=None,
+                        help='Delete zero or more files (additional to the '
+                             'files deleted to satisfy the stop condition) to '
+                             'ensure alignment. If one or more files from '
+                             'certain second/minute/hour/day/month/year is '
+                             'deleted, delete also all other files from that '
+                             'second/minute/hour/day/month/year.')
+
+    group1 = parser.add_argument_group(
+        title='stop condition arguments',
+        description='Use one or more of these arguments to express which and '
+                    'how many flow files should be deleted. If the argument '
+                    'is not present, its value defaluts to "don\'t care". If '
+                    'more than one are present, all of them are evaluated and '
+                    'the program returns immediately after whichever is '
+                    'satisfied.')
+    group1.add_argument('-f', '--files-count',
+                        dest='files_cnt',
+                        type=argument_type_positive_int,
+                        help='Remove specified number of files.')
+    group1.add_argument('-c', '--columns-count',
+                        dest='columns_cnt',
+                        type=argument_type_positive_int,
+                        help='Remove specified number of columns.')
+    group1.add_argument('-b', '--bytes-count',
+                        dest='bytes_cnt',
+                        type=argument_type_positive_int,
+                        help='Remove specified number of bytes.')
+    group1.add_argument('--du-lower-by',
+                        dest='du_lower_by',
+                        type=argument_type_percent,
+                        help='Lower disk usage by the specified percentual '
+                             'value.')
+    group1.add_argument('--du-lower-to',
+                        dest='du_lower_to',
+                        type=argument_type_percent,
+                        help='Lower disk usage to the specified percentual '
+                             'value.')
+    return parser
+
+
+def delete_check_args(args):
+    if (args.files_cnt is None and args.columns_cnt is None and args.bytes_cnt
+            is None and args.du_lower_by is None and args.du_lower_to is None):
+        return 'stop condition is missing'
+
+
+def unlink_earliest(files, files_cnt=None, columns_cnt=None, bytes_cnt=None):
+    if files_cnt is None and columns_cnt is None and bytes_cnt is None:
+        raise ValueError('one of files_cnt, columns_cnt, or bytes_cnt has to '
+                         'be specified')
+    if files_cnt is not None and files_cnt < 0:
+        raise ValueError('files_cnt has to be a positive integer')
+    if columns_cnt is not None and columns_cnt < 0:
+        raise ValueError('columns_cnt has to be a positive integer')
+    if bytes_cnt is not None and bytes_cnt < 0:
+        raise ValueError('bytes_cnt has to be a positive integer')
+
+    target_reached = True
+    aligned = False
+    counters = UnlinkedCounters()
+    while files:
+        if files_cnt is not None and counters.files >= files_cnt:
+            vprint('required number of unlinked files reached')
+            break
+        if columns_cnt is not None and counters.columns >= columns_cnt:
+            vprint('required number of unlinked columns reached')
+            break
+        if bytes_cnt is not None and counters.bytes >= bytes_cnt:
+            vprint('required number of unlinked bytes reached')
+            break
+
+        flow_file = files.pop(0)  # retireve and remove
+        counters.files += 1
+        # test whether this file is the last in the column
+        if (flow_file.name_datetime
+                != next(iter(files), Profile.Channel.FlowFile(None, None))
+                .name_datetime):
+            counters.columns += 1
+            aligned = True
+        else:
+            aligned = False
+        counters.bytes += flow_file.get_size()
+        flow_file.unlink()
+    else:
+        target_reached = False
+
+    return (target_reached, aligned, counters)
+
+
+def align_column(files, resolution):
+    counters = UnlinkedCounters()
+    if not files:
+        return counters
+
+    reference = files[0].name_datetime
+    while files:
+        if not datetime_equal(reference, files[0].name_datetime, resolution):
+            break
+        flow_file = files.pop(0)  # retireve and remove
+        counters.files += 1
+        counters.columns += (flow_file.name_datetime !=
+                             next(iter(files),
+                                  Profile.Channel.FlowFile(None, None))
+                             .name_datetime)
+        counters.bytes += flow_file.get_size()
+        flow_file.unlink()
+
+    return counters
+
+
+def datetime_equal(a, b, resolution):
+    if resolution == 'year':
+        return a.year == b.year
+    elif resolution == 'month':
+        return a.year == b.year and a.month == b.month
+    elif resolution == 'day':
+        return a.year == b.year and a.month == b.month and a.day == b.day
+    elif resolution == 'hour':
+        return (a.year == b.year and a.month == b.month and a.day == b.day
+                and a.hour == b.hour)
+    elif resolution == 'minute':
+        return (a.year == b.year and a.month == b.month and a.day == b.day
+                and a.hour == b.hour and a.minute == b.minute)
+    elif resolution == 'second':
+        return (a.year == b.year and a.month == b.month and a.day == b.day
+                and a.hour == b.hour and a.minute == b.minute
+                and a.second == b.second)
+    else:
+        raise ValueError('invalid resolution "{}"'.format(resolution))
 
 
 def disk_usage(path):
@@ -477,7 +667,7 @@ def disk_usage(path):
 
     # (block, bytes, percentual)
     return (used_blocks, used_blocks * statvfs.f_frsize,
-            used_blocks / statvfs.f_blocks * 100.0)
+            used_blocks / statvfs.f_blocks * 100)
 
 
 def dir_scan(path):
@@ -513,65 +703,6 @@ def min_all(iterable, selector):
         return [i for i in iterable if selector(i) == smallest_selected]
 
 
-def unlink_earliest(channels, files_cnt=1, columns_cnt=0, bytes_cnt=0,
-                    alignment=datetime.timedelta(minutes=1)):
-    if not (files_cnt or columns_cnt or bytes_cnt):
-        raise ValueError('one of files_cnt, columns_cnt, or bytes_cnt has to '
-                         'be specified')
-    if files_cnt and files_cnt < 0:
-        raise ValueError('files_cnt has to be a positive integer')
-    if columns_cnt and columns_cnt < 0:
-        raise ValueError('columns_cnt has to be a positive integer')
-    if bytes_cnt and bytes_cnt < 0:
-        raise ValueError('bytes_cnt has to be a positive integer')
-
-    # get a sorted list (earlier first) of all flow files from all channels
-    all_files = []
-    for channel in channels:
-        all_files += channel.flow_files
-    all_files.sort()
-
-    # regular removal
-    unlinked_files = 0  # number of unlinked files
-    unlinked_columns = 0  # number of unlinked columns of files
-    unlinked_bytes = 0  # size of all unlinked files in bytes
-    while all_files:
-        if ((files_cnt and unlinked_files == files_cnt)
-                or (columns_cnt and unlinked_columns == columns_cnt)
-                or (bytes_cnt and unlinked_bytes >= bytes_cnt)):
-            break
-        flow_file = all_files.pop(0)  # retireve and remove
-        unlinked_files += 1
-        unlinked_columns += (flow_file.name_datetime !=
-                             next(iter(all_files),
-                                  Profile.Channel.FlowFile(None, None))
-                             .name_datetime)
-        unlinked_bytes += flow_file.get_size()
-        flow_file.unlink()
-        print('regular: ', unlinked_files, unlinked_columns, unlinked_bytes)
-
-    # removal due to alignment
-    ref_datetime = flow_file.name_datetime
-    while all_files and alignment:
-        delta = all_files[0].name_datetime - ref_datetime
-        if delta > alignment:
-            break
-        flow_file = all_files.pop(0)  # retireve and remove
-        unlinked_files += 1
-        unlinked_columns += (flow_file.name_datetime !=
-                             next(iter(all_files),
-                                  Profile.Channel.FlowFile(None, None))
-                             .name_datetime)
-        unlinked_bytes += flow_file.get_size()
-        flow_file.unlink()
-        print('alignment: ', unlinked_files, unlinked_columns, unlinked_bytes)
-
-    if unlinked_bytes < bytes_cnt:
-        return -unlinked_files  # could not reach lower bound
-    else:
-        return unlinked_files  # lower bound reached
-
-
 def int_prefix(num):
     num = int(num)
     if abs(num) < 1000:
@@ -592,26 +723,13 @@ def int_prefix_str(num, format_string='{0:.2f} {1}'):
 
 
 ###############################################################################
-if __name__ == "__main__":
-    # set my format for warning print function
-    warnings.formatwarning = myformatwarning
-
-    ########################################
-    # parse command line arguments
+def parse_args():
+    ###########################################################################
+    # global parser and its arguments
     parser = argparse.ArgumentParser(
         description='Flow file data manager.',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
-    parser.add_argument('-u', '--du-upper-bound',
-                        dest='du_upper_bound',
-                        type=float,
-                        default=90.0,
-                        help='Percentual upper bound of disk usage.')
-    parser.add_argument('-l', '--du-lower-bound',
-                        dest='du_lower_bound',
-                        type=float,
-                        default=None,
-                        help='Percentual lower bound of disk usage.')
     parser.add_argument('-n', '--dry-run',
                         dest='dry_run',
                         action='store_true',
@@ -627,27 +745,79 @@ if __name__ == "__main__":
     parser.add_argument('base_path',
                         nargs=1,
                         help='Path to the flow storage directory.')
+
+    subparsers = parser.add_subparsers(title='subcommands',
+                                       description='valid subcommands',
+                                       dest='subcommand_name',
+                                       help='additional help')
+    subparsers.required = True
+
+    ###########################################################################
+    # add parsers for sub-commands and its arguments
+    subcommands = {'delete': None}
+    for subcommand in subcommands:
+        fun = globals()[subcommand + '_add_parser']
+        subcommands[subcommand] = fun(subparsers)
+
+    ###########################################################################
+    # parse all command-line arguments
     args = parser.parse_args()
 
+    ###########################################################################
+    # check arguments of sub-commands
+    for subcommand in subcommands:
+        fun = globals()[subcommand + '_check_args']
+        ret = fun(args)
+        if ret:
+            subcommands[subcommand].error(ret)
+
+    return args
+
+
+def argument_type_positive_int(value_str):
+    try:
+        value_int = int(value_str)
+    except:
+        exc_msg = sys.exc_info()[1]
+        raise argparse.ArgumentTypeError(exc_msg)
+
+    if value_int < 0:
+        raise argparse.ArgumentTypeError('negative value is not allowed')
+    else:
+        return value_int
+
+
+def argument_type_percent(value_str):
+    try:
+        value_float = float(value_str)
+    except:
+        exc_msg = sys.exc_info()[1]
+        raise argparse.ArgumentTypeError(exc_msg)
+
+    if value_float < 0 or value_float > 100:
+        raise argparse.ArgumentTypeError('only real numbers from range '
+                                         '[0, 100] are allowed')
+    else:
+        return value_float
+
+
+###############################################################################
+if __name__ == "__main__":
+    # set my format for warning print function
+    warnings.formatwarning = myformatwarning
+
     ########################################
-    # validate and handle command line arguments
+    # parse command line arguments
+    args = parse_args()
+    # if args.subcommand_name != 'delete':
+    #     raise NotImplementedError('sub-command "{}" is not implemented yet'
+    #                               .format(args.subcommand_name))
+
     # define a verbose print function and a dry run print function
     vprint = vprint_formatter if args.verbose else vprint_formatter_void
     dprint = print
 
-    # check validity of given bounds
-    if args.du_lower_bound and args.du_lower_bound > args.du_upper_bound:
-        raise ValueError('the lower bound is greater than the upper bound')
-    if (args.du_lower_bound and args.du_upper_bound - args.du_lower_bound >
-            DU_BOUND_DIFFERENCE_LIMIT):
-        raise ValueError('the lower and upper bound difference is dangerously '
-                         'large')
-    if args.du_upper_bound > DU_UPPER_BOUND_LIMIT:
-        raise ValueError('the upper bound is dangerously high')
-    if args.du_lower_bound and args.du_lower_bound < DU_LOWER_BOUND_LIMIT:
-        raise ValueError('the lower bound is dangerously low')
-
-    # check validity of given base path
+    # check validity of a given base path
     base_path = Path(args.base_path[0])
     if not base_path.exists():
         raise FileNotFoundError('"{}" does not exist'.format(base_path))
@@ -657,4 +827,4 @@ if __name__ == "__main__":
 
     ########################################
     # do the real work
-    sys.exit(main())
+    sys.exit(args.func())
