@@ -14,13 +14,13 @@
 				<source>*</source>
 			</sourceList>
 			<!--## Filter applied on records, specifying whether it belongs to the profile -->
-			<filter>ipVersion = 4</filter>
+			<filter>ipv4</filter>
 		</channel>
 		<channel name="ch2">
 			<sourceList>
 				<source>*</source>
 			</sourceList>
-			<filter>ipVersion = 6</filter>
+			<filter>ipv6</filter>
 		</channel>
 	</channelList>
 
@@ -39,12 +39,7 @@
 						<source>ch1</source>
 						<source>ch2</source>
 					</sourceList>
-					<filter>
-						sourceTransportPort == 110 OR
-						destinationTransportPort == 110 OR
-						sourceTransportPort == 995 OR
-						destinationTransportPort == 995
-					</filter>
+					<filter>port in [110, 995]</filter>
 				</channel>
 
 				<!-- IMAP flows -->
@@ -53,12 +48,7 @@
 						<source>ch1</source>
 						<source>ch2</source>
 					</sourceList>
-					<filter>
-						sourceTransportPort == 143 OR
-						destinationTransportPort == 143 OR
-						sourceTransportPort == 993 OR
-						destinationTransportPort == 993
-					</filter>
+					<filter>port in [143, 993]</filter>
 				</channel>
 
 				<!-- SMTP flows -->
@@ -67,12 +57,7 @@
 						<source>ch1</source>
 						<source>ch2</source>
 					</sourceList>
-					<filter>
-						sourceTransportPort == 25 OR
-						destinationTransportPort == 25 OR
-						sourceTransportPort == 465 OR
-						destinationTransportPort == 465
-					</filter>
+					<filter>port in [25, 465]</filter>
 				</channel>
 			</channelList>
 

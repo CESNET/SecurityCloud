@@ -45,7 +45,7 @@
 				<!--## Filename = storagePath + prefix + suffixMask -->
 				<!--## Storage directory is specified in profile.xml -->
 				<!--## Specifies name prefix for output files. -->
-				<prefix>nfcapd.</prefix>
+				<prefix>lnf.</prefix>
 				<!--## File identification -->
 				<suffixMask>%Y%m%d%H%M%S</suffixMask>
 
