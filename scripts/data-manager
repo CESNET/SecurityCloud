@@ -191,6 +191,7 @@ class Profile:
             self.path = path  # pathlib path to the channel's base directory
             self.parent = parent  # channel's parent Profile
             self.flow_files = []  # list of instances of FlowFile
+            self.date_dirs = set()  # set of directories
 
         def __repr__(self):
             return ('{}(name={}, parent={}, earliest_flow_file={}, '
@@ -209,28 +210,27 @@ class Profile:
         def get_latest_flow_file(self):
             return self.flow_files[-1] if not self.is_empty() else None
 
-        def remove_empty_parent_directories(self, flow_file):
-            """Only works with YYYY/MM/DD directory hierarchy."""
-
-            if flow_file.name_datetime.date() != flow_file.path_date:
-                warnings.warn('remove empty parent directories: "{}": '
-                              'path/name date mismatch, unable to remove '
-                              'empty directories'.format(flow_file.path))
-                return
-
-            parent_dir = flow_file.path.parent
-            for i in ['day', 'month', 'year']:
-                if dir_is_empty(parent_dir):
-                    if args.dry_run:
-                        dprint('would remove empty {} directory "{}"'
-                               .format(i, parent_dir))
+        def remove_empty_directories(self):
+            while self.date_dirs:
+                empty = set()
+                not_empty = set()
+                for date_dir in self.date_dirs:
+                    if dir_is_empty(date_dir):
+                        empty.add(date_dir)
                     else:
-                        vprint('removing empty {} directory "{}"'
-                               .format(i, parent_dir))
-                        parent_dir.rmdir()
-                else:
-                    break
-                parent_dir = parent_dir.parent
+                        not_empty.add(date_dir)
+
+                if not empty:
+                    break  # no empty directories, nothing to delete any more
+                self.date_dirs = not_empty
+                for date_dir in empty:
+                    if args.dry_run:
+                        dprint('would remove empty directory "{}"'
+                               .format(date_dir))
+                    else:
+                        vprint('removing empty directory "{}"'
+                               .format(date_dir))
+                        date_dir.rmdir()
 
         def scan(self):
             """Scan channel's base directory and look for flow files."""
@@ -240,7 +240,10 @@ class Profile:
             vprint('channel directory "{}" scan:'.format(self.path.name),
                    end=' ')
             for path in self.path.rglob('*'):  # recursively list all files
-                if not path.is_file():
+                if path.is_dir():
+                    self.date_dirs.add(path)
+                    continue
+                elif not path.is_file():
                     continue
                 elif path.name.startswith('.'):
                     warnings.warn('channel scan: found invalid file "{}" '
@@ -348,11 +351,9 @@ class Profile:
 
             def unlink(self):
                 if args.dry_run:
-                    dprint('would unlink "{}" of {}B'
-                           .format(self.path, int_prefix_str(self.get_size())))
+                    dprint('would unlink "{}"'.format(self.path))
                 else:
-                    vprint('unlinking "{}" of {}B'
-                           .format(self.path, int_prefix_str(self.get_size())))
+                    vprint('unlinking "{}"'.format(self.path))
                     self.path.unlink()
 
 
@@ -466,13 +467,15 @@ def delete_main():
 
     # get a sorted list (earliest first) of all flow files from all channels
     all_files = []
+    all_channels = set()
     for node in nodes:
         for profile in node.profiles:
             for channel in profile.get_channels(recursively=True):
+                all_channels.add(channel)
                 all_files += channel.flow_files
     all_files.sort()
 
-    target_reached, aligned, counters = unlink_earliest(
+    target_reached, aligned, dcounters = unlink_earliest(
             all_files, files_cnt=args.files_cnt, columns_cnt=args.columns_cnt,
             bytes_cnt=min_bytes_cnt)
     if not target_reached:
@@ -481,19 +484,28 @@ def delete_main():
                       .format('would be' if args.dry_run else 'were'))
 
     # align only if it was requested and if at least one file was unlinked
-    if args.align_to and counters.files:
+    acounters = UnlinkedCounters()
+    if args.align_to and dcounters.files:
         if aligned:
             vprint('already aligned')
         else:
             vprint('aligning to {}'.format(args.align_to))
-            alignment_counters = align_column(all_files, args.align_to)
-            counters.add(alignment_counters)
+            acounters = align_column(all_files, args.align_to)
 
-    du_after = disk_usage(base_path)
-    print('delete summary: {} {} files, {} columns, {}B'
+    # cleanup by recursively deleting empty directories
+    if args.cleanup:
+        for channel in all_channels:
+            channel.remove_empty_directories()
+
+    print('delete summary:    {} {} files, {} columns, {}B'
           .format('would unlink' if args.dry_run else 'unlinked',
-                  counters.files, counters.columns,
-                  int_prefix_str(counters.bytes)))
+                  dcounters.files, dcounters.columns,
+                  int_prefix_str(dcounters.bytes)))
+    print('alignment summary: {} {} files, {} columns, {}B'
+          .format('would unlink' if args.dry_run else 'unlinked',
+                  acounters.files, acounters.columns,
+                  int_prefix_str(acounters.bytes)))
+    du_after = disk_usage(base_path)
     print('disk usage summary: '
           'before: {}B ({:.2f} %), '
           'after: {}B ({:.2f} %), '
@@ -505,7 +517,9 @@ def delete_main():
 
 
 def delete_add_parser(subparsers):
-    parser = subparsers.add_parser('delete', help='delete help')
+    parser = subparsers.add_parser('delete',
+            help='delete help',
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.set_defaults(func=delete_main)
 
     parser.add_argument('-u', '--du-boundary',
@@ -515,7 +529,6 @@ def delete_add_parser(subparsers):
                         help='Percentual upper boundary of disk usage: do '
                              'nothing unless the current disk usage is '
                              'greater than this value.')
-
     parser.add_argument('--align-to',
                         dest='align_to',
                         choices=['second', 'minute', 'hour', 'day', 'month',
@@ -527,6 +540,16 @@ def delete_add_parser(subparsers):
                              'certain second/minute/hour/day/month/year is '
                              'deleted, delete also all other files from that '
                              'second/minute/hour/day/month/year.')
+    parser.add_argument('--cleanup',
+                        dest='cleanup',
+                        action='store_true',
+                        help='Remove empty directories inside channels.')
+    parser.add_argument('--no-cleanup',
+                        dest='cleanup',
+                        action='store_false',
+                        help='Don\'t remove empty directories inside '
+                             'channels.')
+    parser.set_defaults(cleanup=True)
 
     group1 = parser.add_argument_group(
         title='stop condition arguments',
