@@ -419,7 +419,7 @@ OCF_RESKEY_binary_default=samplicate
 : "${OCF_RESKEY_binary="${OCF_RESKEY_binary_default}"}"
 
 #initialize global constants
-readonly PIDFILE="${HA_VARRUN}/samplicate.pid"
+readonly PIDFILE="${HA_VARRUN}/${OCF_RESOURCE_INSTANCE}.pid"
 readonly LOG_PREFIX="${__OCF_ACTION}: "
 
 #argument check
