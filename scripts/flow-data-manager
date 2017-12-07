@@ -838,7 +838,7 @@ def lock_release(lock_file_path):
         raise Exception('"{}" does not point to a regular file'
                         .format(lock_file_path))
 
-    with open(lock_file_path, mode='r') as lock_file:
+    with open(str(lock_file_path), mode='r') as lock_file:
         my_pid = os.getpid()
         lock_file_pid = int(lock_file.read().strip())
         if my_pid != lock_file_pid:
@@ -865,7 +865,7 @@ def lock_acquire(lock_file_path):
         raise FileExistsError('"{}": lock file already exists'
                               .format(lock_file_path))
 
-    with open(lock_file_path, mode='w') as lock_file:
+    with open(str(lock_file_path), mode='w') as lock_file:
         lock_file.write(str(os.getpid()) + '\n')
     atexit.register(lock_release, lock_file_path)
 
