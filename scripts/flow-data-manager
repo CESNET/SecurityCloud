@@ -45,6 +45,8 @@ import argparse
 import datetime
 import warnings
 import atexit
+import copy
+import shutil
 from pathlib import Path
 
 
@@ -65,12 +67,15 @@ DATETIME_PATTERN = (r'(?P<year>\d{4})(?P<month>\d{2})(?P<day>\d{2})'
                     r'(?P<second>\d{2})?')
 # precompiled regex for YYYYMMDDHHMM or YYYYMMDDHHMMSS
 DATETIME_REGEX = re.compile(DATETIME_PATTERN, re.ASCII)
+FLOW_FILE_PREFIX = 'lnf.'
+BFINDEX_FILE_PREFIX = 'bfi.'
 
 # metric prefixes for int_prefix()
 METRIC_PREFIXES = 'kMGTPEZYyzafpnµm'
 
 # file name of the lock file
 LOCK_FILE_NAME = 'flow-data-manager.lock'
+
 
 ###############################################################################
 class Node:
@@ -80,13 +85,14 @@ class Node:
     profile called "live".
     """
 
-    def __init__(self, path):
-        self.path = path
+    def __init__(self, base_path):
+        self.base_path = base_path
         self.profiles = []
 
     def __repr__(self):
         return '{}(name={}, profiles={})'.format(type(self).__name__,
-                                                 self.path.name, self.profiles)
+                                                 self.base_path.name,
+                                                 self.profiles)
 
     def scan(self):
         """Scan node's base directory and look for base profiles.
@@ -97,8 +103,9 @@ class Node:
 
         self.profiles.clear()
 
-        vprint('node directory "{}" scan:'.format(self.path.name), end=' ')
-        content_dict = dir_scan(self.path)
+        vprint('node directory "{}" scan:'.format(self.base_path.name),
+               end=' ')
+        content_dict = dir_scan(self.base_path)
         vprint('using dirs: {}, ignoring: {}'
                .format(content_dict['dirs_n'], content_dict['others_n']),
                use_prefix=False)
@@ -111,15 +118,16 @@ class Node:
 class Profile:
     """IPFIXcol profile/subprofile representation."""
 
-    def __init__(self, path, parent):
-        self.path = path  # pathlib path to the profile's base directory
-        self.parent = parent  # profile's parent Profile or Node
+    def __init__(self, base_path, parent_obj):
+        self.base_path = base_path  # pathlib path to the profile's base dir
+        self.parent_obj = parent_obj  # profile's parent Profile or Node
         self.channels = []  # list of instances of Channel
         self.subprofiles = []  # list of instances of Profile
 
     def __repr__(self):
-        return '{}(name={}, parent={}, channels={}, subprofiles={})'\
-            .format(type(self).__name__, self.path.name, self.parent.path.name,
+        return '{}(name={}, parent_obj={}, channels={}, subprofiles={})'\
+            .format(type(self).__name__, self.base_path.name,
+                    self.parent_obj.base_path.name,
                     self.channels, self.subprofiles)
 
     def scan(self):
@@ -134,8 +142,9 @@ class Profile:
         self.channels.clear()
         self.subprofiles.clear()
 
-        vprint('profile directory "{}" scan:'.format(self.path.name), end=' ')
-        content_dict = dir_scan(self.path)
+        vprint('profile directory "{}" scan:'.format(self.base_path.name),
+               end=' ')
+        content_dict = dir_scan(self.base_path)
         # further separate found directories into channels directory, rrd
         # directory, and other directories == subprofile directories
         for subdir in content_dict['dirs']:
@@ -153,7 +162,7 @@ class Profile:
 
         if 'channels_dir' not in content_dict:
             raise Exception('profile "{}" is missing the "channels" directory'
-                            .format(self.path.name))
+                            .format(self.base_path.name))
         vprint('channels dir: {}, RRD dir: {}, subprofiles list: {}, '
                'ignoring files: {}'.format(content_dict['channels_dir_n'],
                                            content_dict['rrd_dir_n'],
@@ -190,17 +199,17 @@ class Profile:
     class Channel:
         """IPFIXcol channel representation."""
 
-        def __init__(self, path, parent):
-            self.path = path  # pathlib path to the channel's base directory
-            self.parent = parent  # channel's parent Profile
+        def __init__(self, base_path, parent_profile):
+            self.base_path = base_path  # pathlib path to the channel's basedir
+            self.parent_profile = parent_profile  # channel's parent Profile
             self.flow_files = []  # list of instances of FlowFile
             self.date_dirs = set()  # set of directories
 
         def __repr__(self):
-            return ('{}(name={}, parent={}, earliest_flow_file={}, '
+            return ('{}(name={}, parent_profile={}, earliest_flow_file={}, '
                     'latest_flow_file={})'
-                    .format(type(self).__name__, self.path.name,
-                            self.parent.path.name,
+                    .format(type(self).__name__, self.base_path.name,
+                            self.parent_profile.base_path.name,
                             self.get_earliest_flow_file(),
                             self.get_latest_flow_file()))
 
@@ -213,54 +222,78 @@ class Profile:
         def get_latest_flow_file(self):
             return self.flow_files[-1] if not self.is_empty() else None
 
-        def remove_empty_directories(self):
-            while self.date_dirs:
-                empty = set()
-                not_empty = set()
-                for date_dir in self.date_dirs:
-                    if dir_is_empty(date_dir):
-                        empty.add(date_dir)
-                    else:
-                        not_empty.add(date_dir)
+        def remove_unused_directories(self):
+            """ Remove directories from which all flow files were unlinked. """
+            contains_ffs = set()  # dirs which contains at least 1 flow file
+            may_contain_ffs = set()  # dirst which may conatin some ff
+            for flow_file in self.flow_files:
+                if flow_file.path.exists():  # ffs which were not unlinked
+                    contains_ffs.add(flow_file.path.parent)
+                else:  # ffs which were unlinked
+                    may_contain_ffs.add(flow_file.path.parent)
+            doesnt_contain_ffs = may_contain_ffs - contains_ffs
+            doesnt_contain_ffs.discard(self.base_path)  # never remove base dir
+            for directory in doesnt_contain_ffs:
+                vprint('channel "{}" cleanup: removing directory with no flow '
+                       'files "{}"'.format(self.base_path.name, directory))
+                self.date_dirs.remove(directory)
+                dir_remove(directory, True)
+            return len(doesnt_contain_ffs)
 
-                if not empty:
-                    break  # no empty directories, nothing to delete any more
-                self.date_dirs = not_empty
-                for date_dir in empty:
-                    if args.dry_run:
-                        dprint('would remove empty directory "{}"'
-                               .format(date_dir))
-                    else:
-                        vprint('removing empty directory "{}"'
-                               .format(date_dir))
-                        date_dir.rmdir()
+        def remove_empty_directories(self):
+            """ Repeatedly remove empty directories until no date_dir is empty.
+            """
+            possibly_empty = copy.deepcopy(self.date_dirs)
+            removed_counter = 0
+            while possibly_empty:
+                possibly_empty.discard(self.base_path)  # never remove base dir
+                possibly_empty_next = set()
+                for directory in possibly_empty:
+                    if dir_is_empty(directory):
+                        possibly_empty_next.add(directory.parent)
+                        self.date_dirs.remove(directory)
+                        vprint('channel "{}" cleanup: removing empty '
+                               'directory "{}"'.format(self.base_path.name,
+                                                       directory))
+                        dir_remove(directory)
+                        removed_counter += 1
+                possibly_empty = self.date_dirs.intersection(
+                        possibly_empty_next)
+            return removed_counter
 
         def scan(self):
             """Scan channel's base directory and look for flow files."""
 
             self.flow_files.clear()
 
-            vprint('channel directory "{}" scan:'.format(self.path.name),
+            vprint('channel directory "{}" scan:'.format(self.base_path.name),
                    end=' ')
-            for path in self.path.rglob('*'):  # recursively list all files
+            # recursively iterate over all files (excluding base_path)
+            for path in self.base_path.rglob('*'):
                 if path.is_dir():
                     self.date_dirs.add(path)
                     continue
                 elif not path.is_file():
-                    continue
-                elif path.name.startswith('.'):
-                    warnings.warn('channel scan: found invalid file "{}" '
+                    warnings.warn('channel scan: found unknown file "{}", '
+                                  'which is not regular file nor directory '
                                   'in "{}" channel storage hierarchy, skipping'
-                                  .format(path, self.path.name))
-
-                flow_file = self.FlowFile(path, self)
-                try:
-                    flow_file.parse_path()
-                except ValueError as e:
-                    warnings.warn(e.args[0] + ', skipping')
+                                  .format(path, self.base_path.name))
                     continue
+                elif path.name.startswith(FLOW_FILE_PREFIX):
+                    flow_file = self.FlowFile(path, self)
+                    try:
+                        flow_file.parse_path()
+                    except ValueError as e:
+                        warnings.warn(e.args[0] + ', skipping')
+                        continue
+                    self.flow_files.append(flow_file)
+                elif path.name.startswith(BFINDEX_FILE_PREFIX):
+                    continue  # ignore bloom filter index files
+                else:
+                    warnings.warn('channel scan: found unknown file "{}" '
+                                  'in "{}" channel storage hierarchy, skipping'
+                                  .format(path, self.base_path.name))
 
-                self.flow_files.append(flow_file)
             self.flow_files.sort(key=lambda flow_file: flow_file.name_datetime)
 
             if self.flow_files:
@@ -275,21 +308,20 @@ class Profile:
         class FlowFile:
             """Flow file representation."""
 
-            def __init__(self, path, parent):
+            def __init__(self, path, parent_channel):
                 self.path = path  # pathlib path to the file
-                self.parent = parent  # file's parent Channel
+                self.parent_channel = parent_channel  # file's parent Channel
                 self.name_datetime = None
                 self.path_date = None
 
                 self._size = None  # never use directly, always use get_size()
 
             def __repr__(self):
-                return ('{}(name={}, parent={}, name_datetime={}, '
-                        'path_date={})'.format(type(self).__name__,
-                                               self.path.name,
-                                               self.parent.path.name,
-                                               self.name_datetime,
-                                               self.path_date))
+                return ('{}(name={}, parent_channel={}, name_datetime={}, '
+                        'path_date={})'
+                        .format(type(self).__name__, self.path.name,
+                                self.parent_channel.base_path.name,
+                                self.name_datetime, self.path_date))
 
             def __lt__(self, other):
                 return self.name_datetime < other.name_datetime
@@ -402,17 +434,64 @@ def myformatwarning(message, category, filename, lineno, line=None):
 
 
 ###############################################################################
+def scan_main():
+    scan_nodes()
+
+
+def scan_add_parser(subparsers):
+    parser = subparsers.add_parser(
+            'scan', help='scan help',
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.set_defaults(subcommand_func_main=scan_main)
+    parser.set_defaults(subcommand_name='scan')
+    return parser
+
+
+def scan_check_args(args):
+    return
+
+
+def scan_nodes():
+    # find node directories in the base path
+    vprint('base directory "{}" scan:'.format(base_path_arg), end=' ')
+    content_dict = dir_scan(base_path_arg)
+    vprint('using dirs: {}, ignoring files: {}'
+           .format(content_dict['dirs_n'], content_dict['others_n']),
+           use_prefix=False)
+    if not content_dict['dirs']:
+        raise Exception('node directory lookup: nothing appropriate found in '
+                        'the given directory')
+
+    # check if all node directories are placed on the same device
+    ref_st_dev = next(iter(content_dict['dirs'])).stat().st_dev
+    if not all(ref_st_dev == node_dir.stat().st_dev
+               for node_dir in content_dict['dirs']):
+        raise Exception('node directory lookup: one or more node directories '
+                        'are placed across different devices')
+
+    # scan all node directories and create profiles, recursively
+    nodes = []
+    for path in content_dict['dirs']:
+        node = Node(path)
+        node.scan()
+        nodes.append(node)
+
+    return nodes
+
+
+###############################################################################
 def delete_main():
     rc = 0
 
     # check if used disk space is below the given upper bound
-    du_before = disk_usage(base_path)
+    du_before = disk_usage(base_path_arg)
     if du_before[2] < args.du_boundary:
         vprint('nothing to do, used disk space ({:.2f} %) is below the disk '
                'usage boundary ({:.2f} %)'.format(du_before[2],
                                                   args.du_boundary))
         return 0
 
+    # calculate number of files/columns/bytes to unlink
     bytes_cnt_list = []
     if args.bytes_cnt is not None:
         bytes_cnt_list.append(args.bytes_cnt)
@@ -425,7 +504,7 @@ def delete_main():
             du_lower_list.append(args.du_lower_to)
         max_du_lower_to = max(du_lower_list)
 
-        statvfs = os.statvfs(str(base_path))
+        statvfs = os.statvfs(str(base_path_arg))
         now_used_blocks = statvfs.f_blocks - statvfs.f_bavail
         des_used_blocks = statvfs.f_blocks * (max_du_lower_to / 100)
         diff_blocks = now_used_blocks - des_used_blocks
@@ -444,40 +523,17 @@ def delete_main():
                    int_prefix_str(min_bytes_cnt) if min_bytes_cnt is not None
                    else '?'))
 
-    # find node directories in the base path
-    vprint('base directory "{}" scan:'.format(base_path), end=' ')
-    content_dict = dir_scan(base_path)
-    vprint('using dirs: {}, ignoring files: {}'
-           .format(content_dict['dirs_n'], content_dict['others_n']),
-           use_prefix=False)
-    if not content_dict['dirs']:
-        raise Exception('node directory lookup: nothing appropriate found in '
-                        'the given directory')
-
-    # check if all node directories are placed on the same device
-    ref_st_dev = next(iter(content_dict['dirs'])).stat().st_dev
-    if not all(ref_st_dev == node_dir.stat().st_dev
-               for node_dir in content_dict['dirs']):
-        raise Exception('node directory lookup: one or more node directories '
-                        'are placed on different devices')
-
-    # scan all node directories and create profiles, recursively
-    nodes = []
-    for path in content_dict['dirs']:
-        node = Node(path)
-        node.scan()
-        nodes.append(node)
-
     # get a sorted list (earliest first) of all flow files from all channels
     all_files = []
     all_channels = set()
-    for node in nodes:
+    for node in scan_nodes():
         for profile in node.profiles:
             for channel in profile.get_channels(recursively=True):
                 all_channels.add(channel)
                 all_files += channel.flow_files
     all_files.sort()
 
+    # unlink flow files from the list until certain stop condition is met
     target_reached, aligned, dcounters = unlink_earliest(
             all_files, files_cnt=args.files_cnt, columns_cnt=args.columns_cnt,
             bytes_cnt=min_bytes_cnt)
@@ -496,34 +552,41 @@ def delete_main():
             acounters = align_column(all_files, args.align_to)
 
     # cleanup by recursively deleting empty directories
+    cleanup_counter = 0
+    empty_counter = 0
     if args.cleanup:
         for channel in all_channels:
-            channel.remove_empty_directories()
+            cleanup_counter += channel.remove_unused_directories()
+            empty_counter += channel.remove_empty_directories()
 
-    print('delete summary:    {} {} files, {} columns, {}B'
+    print('delete summary:     {} {} file(s), {} column(s), {}B'
           .format('would unlink' if args.dry_run else 'unlinked',
                   dcounters.files, dcounters.columns,
                   int_prefix_str(dcounters.bytes)))
-    print('alignment summary: {} {} files, {} columns, {}B'
+    print('alignment summary:  {} {} file(s), {} column(s), {}B'
           .format('would unlink' if args.dry_run else 'unlinked',
                   acounters.files, acounters.columns,
                   int_prefix_str(acounters.bytes)))
-    du_after = disk_usage(base_path)
+    print('cleanup summary:    {} {} flow dir(s), {} empty dir(s)'
+          .format('would remove' if args.dry_run else 'removed',
+                  cleanup_counter, empty_counter))
+    du_after = disk_usage(base_path_arg)
     print('disk usage summary: '
-          'before: {}B ({:.2f} %), '
-          'after: {}B ({:.2f} %), '
-          'difference: {}B'
+          'before {}B ({:.2f} %), '
+          'after {}B ({:.2f} %), '
+          'difference {}B'
           .format(int_prefix_str(du_before[1]), du_before[2],
                   int_prefix_str(du_after[1]), du_after[2],
-                  int_prefix_str(abs(du_before[1] - du_after[1]))))
+                  int_prefix_str(du_before[1] - du_after[1])))
     return rc
 
 
 def delete_add_parser(subparsers):
-    parser = subparsers.add_parser('delete',
-            help='delete help',
+    parser = subparsers.add_parser(
+            'delete', help='delete help',
             formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.set_defaults(func=delete_main)
+    parser.set_defaults(subcommand_func_main=delete_main)
+    parser.set_defaults(subcommand_name='delete')
 
     parser.add_argument('-u', '--du-boundary',
                         dest='du_boundary',
@@ -546,12 +609,13 @@ def delete_add_parser(subparsers):
     parser.add_argument('--cleanup',
                         dest='cleanup',
                         action='store_true',
-                        help='Remove empty directories inside channels.')
+                        help='Remove directories with no flow files inside '
+                             'channels.')
     parser.add_argument('--no-cleanup',
                         dest='cleanup',
                         action='store_false',
-                        help='Don\'t remove empty directories inside '
-                             'channels.')
+                        help='Don\'t remove directories with no flow files '
+                             'inside channels.')
     parser.set_defaults(cleanup=True)
 
     group1 = parser.add_argument_group(
@@ -594,6 +658,7 @@ def delete_check_args(args):
 
 
 def unlink_earliest(files, files_cnt=None, columns_cnt=None, bytes_cnt=None):
+    # check validity of argument and their combinations
     if files_cnt is None and columns_cnt is None and bytes_cnt is None:
         raise ValueError('one of files_cnt, columns_cnt, or bytes_cnt has to '
                          'be specified')
@@ -608,6 +673,7 @@ def unlink_earliest(files, files_cnt=None, columns_cnt=None, bytes_cnt=None):
     aligned = False
     counters = UnlinkedCounters()
     while files:
+        # test all specified stop conditions
         if files_cnt is not None and counters.files >= files_cnt:
             vprint('required number of unlinked files reached')
             break
@@ -722,6 +788,21 @@ def dir_is_empty(path):
     return not any(True for _ in path.iterdir())
 
 
+def dir_remove(path, recursively=False):
+    if recursively:
+        if args.dry_run:
+            dprint('would remove directory "{}" (recursively)'.format(path))
+        else:
+            vprint('removing directory "{}" (recursively)'.format(path))
+            shutil.rmtree(path)
+    else:
+        if args.dry_run:
+            dprint('would remove directory "{}" (nonrecursively)'.format(path))
+        else:
+            vprint('removing directory "{}" (nonrecursively)'.format(path))
+            path.rmdir()
+
+
 def min_all(iterable, selector):
         """Return list of all smallest items in an iterable."""
         smallest = min(iterable, key=selector)
@@ -780,22 +861,23 @@ def parse_args():
 
     ###########################################################################
     # add parsers for sub-commands and its arguments
-    subcommands = {'delete': None}
-    for subcommand in subcommands:
-        fun = globals()[subcommand + '_add_parser']
-        subcommands[subcommand] = fun(subparsers)
+    subcommands_setup_dict = {
+            'scan': [scan_add_parser, scan_check_args, None],
+            'delete': [delete_add_parser, delete_check_args, None],
+            }
+    for cmd in subcommands_setup_dict:
+        subcommands_setup_dict[cmd][2] = \
+                subcommands_setup_dict[cmd][0](subparsers)  # call add_parser
 
     ###########################################################################
     # parse all command-line arguments
     args = parser.parse_args()
 
     ###########################################################################
-    # check arguments of sub-commands
-    for subcommand in subcommands:
-        fun = globals()[subcommand + '_check_args']
-        ret = fun(args)
-        if ret:
-            subcommands[subcommand].error(ret)
+    # check arguments of the specified sub-command by calling check_args func.
+    err_str = subcommands_setup_dict[args.subcommand_name][1](args)
+    if err_str:
+        subcommands_setup_dict[args.subcommand_name][2].error(err_str)
 
     return args
 
@@ -842,7 +924,7 @@ def lock_release(lock_file_path):
         my_pid = os.getpid()
         lock_file_pid = int(lock_file.read().strip())
         if my_pid != lock_file_pid:
-            raise Exception('PID of this process ({}) differs from PID in ' \
+            raise Exception('PID of this process ({}) differs from PID in '
                             'the lock file ({})'.format(my_pid, lock_file_pid))
     lock_file_path.unlink()
 
@@ -854,8 +936,8 @@ def lock_acquire(lock_file_path):
     running at the same time. Work on single machine but also on cluster if
     lock_file_path pointing to a shared storage.
 
-    lock_release is registered as a cleanup functions by the atexit module.
-    This functions is automatically executed upon normal interpreter
+    lock_release is registered as a lock-cleanup functions by the atexit
+    module. This functions is automatically executed upon normal interpreter
     termination. It is not called when the program is killed by a signal not
     handled by Python, when a Python fatal internal error is detected, or when
     os._exit() is called.
@@ -887,17 +969,17 @@ if __name__ == "__main__":
     dprint = print
 
     # check validity of a given base path
-    base_path = Path(args.base_path[0])
-    if not base_path.exists():
-        raise FileNotFoundError('"{}" does not exist'.format(base_path))
-    if not base_path.is_dir():
+    base_path_arg = Path(args.base_path[0])
+    if not base_path_arg.exists():
+        raise FileNotFoundError('"{}" does not exist'.format(base_path_arg))
+    if not base_path_arg.is_dir():
         raise NotADirectoryError('"{}" does not point to a directory'
-                                 .format(base_path))
+                                 .format(base_path_arg))
 
     ########################################
     # acquire file lock to prevent multiple instances running simultaneously
-    lock_acquire(Path(base_path, LOCK_FILE_NAME))
+    lock_acquire(Path(base_path_arg, LOCK_FILE_NAME))
 
     ########################################
     # do the real work
-    sys.exit(args.func())
+    sys.exit(args.subcommand_func_main())
