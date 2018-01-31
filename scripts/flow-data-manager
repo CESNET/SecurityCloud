@@ -71,7 +71,7 @@ FLOW_FILE_PREFIX = 'lnf.'
 BFINDEX_FILE_PREFIX = 'bfi.'
 
 # metric prefixes for int_prefix()
-METRIC_PREFIXES = 'kMGTPEZYyzafpnµm'
+METRIC_PREFIXES = 'kMGTPEZYyzafpn\xb5m'  # \xb5 is a micro sign
 
 # file name of the lock file
 LOCK_FILE_NAME = 'flow-data-manager.lock'
