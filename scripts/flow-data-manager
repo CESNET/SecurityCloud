@@ -794,7 +794,7 @@ def dir_remove(path, recursively=False):
             dprint('would remove directory "{}" (recursively)'.format(path))
         else:
             vprint('removing directory "{}" (recursively)'.format(path))
-            shutil.rmtree(path)
+            shutil.rmtree(str(path))
     else:
         if args.dry_run:
             dprint('would remove directory "{}" (nonrecursively)'.format(path))

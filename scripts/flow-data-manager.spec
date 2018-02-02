@@ -1,6 +1,6 @@
 # preamble #####################################################################
 Name:           flow-data-manager
-Version:        0.1.0
+Version:        0.1.1
 Release:        1%{?dist}
 Summary:        Flow file data manager, part of the SecurityCloud toolset
 
