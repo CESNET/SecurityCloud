@@ -1,7 +1,7 @@
 # preamble #####################################################################
 Name:           flow-data-manager
 Version:        0.1.1
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Flow file data manager, part of the SecurityCloud toolset
 
 License:        BSD
@@ -24,7 +24,7 @@ Flow file data manager, part of the SecurityCloud toolset.
 %install
 rm -rf $RPM_BUILD_ROOT
 mkdir -p %{buildroot}%{_bindir}
-install %{_sourcedir}/%{name} %{buildroot}%{_bindir}
+install %{SOURCE0} %{buildroot}%{_bindir}
 
 # clean section ################################################################
 %clean
@@ -36,5 +36,8 @@ rm -rf $RPM_BUILD_ROOT
 
 # changelog section ############################################################
 %changelog
+* Thu Mar 22 2018 Jan Wrona <wrona@cesnet.cz> - 0.1.1-2
+- Fix improper use of _sourcedir macro, subsitue by SOURCE0.
+
 * Wed Jan 31 2018 Jan Wrona <wrona@cesnet.cz> - 0.1.0-1
 - First vesrion of the specfile.
