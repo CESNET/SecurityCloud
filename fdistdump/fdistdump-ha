@@ -49,20 +49,19 @@ import signal
 import warnings
 import shutil
 import shlex
+import copy
+from abc import ABC, abstractmethod
 
 
 OUTPUT_PREFIX = os.path.basename(__file__).upper() if '__file__' in globals() \
     else 'FDISTDUMP-HA'
 
-binaries = {
+EXECUTABLES = {
     'node': 'crm_node',
     'mon': 'crm_mon',
     'attribute': 'crm_attribute'
 }
-# check presence of used binaries
-for key, value in binaries.items():
-    if shutil.which(value) is None:
-        raise OSError('executable "{}" not found.'.format(value))
+SUBPROCESS_TIMEOUT = 5
 
 
 ###############################################################################
@@ -72,25 +71,293 @@ class Error(Exception):
     pass
 
 
-class GraphError(Error):
-    """Exception raised for errors in the graph.
-
-    Attributes:
-        message -- explanation of the error
+###############################################################################
+class Cluster:
+    """
+    Representation of a flow processing cluster -- nodes and attributes.
     """
 
-    def __init__(self, message):
-        self.message = message
+    def __init__(self):
+        self.__load_cluster_attributes()
+        self.__load_nodes()
+        self.check_subcollector_topology()
+        self.update_status()
+
+    def __repr__(self):
+        return '{}(flow_original_path={}, flow_mirror_path={} ' \
+            'proxy_nodes={}, subcollector_nodes={}, subcollector_graph={})' \
+            .format(type(self).__name__, self.flow_original_path,
+                    self.flow_mirror_path, self.proxy_nodes,
+                    self.subcollector_nodes, self.subcollector_graph_str())
+
+    def __load_nodes(self):
+        self.proxy_nodes = set()
+        subcollectors = set()
+        for node_id, node_name in self.__get_node_list():
+            role = get_cluster_attribute('role', node_name)
+            if not role:
+                raise Cluster.ClusterError('node "{}" has undefined the role '
+                                           'attribute'.format(node_name))
+            elif role == 'proxy':
+                self.proxy_nodes.add(ProxyNode(node_id, node_name))
+            elif role == 'subcollector':
+                subcollector = SubcollectorNode(node_id, node_name)
+                successor_id_str = get_cluster_attribute('successor-id',
+                                                         node_name)
+                if not successor_id_str:
+                    raise Cluster.ClusterError('node "{}" has undefined the '
+                                               'successor-id attribute'
+                                               .format(node_id))
+                try:
+                    successor_id = int(successor_id_str)
+                except:
+                    raise Cluster.ClusterError('node "{}" has an invalid '
+                                               'successor-id attribute value: '
+                                               '{}'.format(node_id,
+                                                           successor_id_str))
+                subcollectors.add((subcollector, successor_id))
+            else:  # role defined, but the value is not proxy nor subcollector
+                raise Cluster.ClusterError('node "{}" has an invalid role '
+                                           'attribute value: {}'
+                                           .format(node_id, role))
+
+        # loop through subcollectors and assign a successor and a predecessor
+        # (a SubcollectorNode object) to each one of them
+        self.subcollector_nodes = set()
+        for subcollector, successor_id in subcollectors:
+            try:
+                subcollector.successor = next(sub for sub, id in subcollectors
+                                              if successor_id == sub.id)
+            except StopIteration:
+                raise Cluster.ClusterError('node "{}" has an unmatched '
+                                           'successor ID'
+                                           .format(subcollector.id))
+            subcollector.successor.predecessor = subcollector
+            self.subcollector_nodes.add(subcollector)
+
+        # probably a paranoid check
+        if not self.proxy_nodes.isdisjoint(self.subcollector_nodes):
+            raise Cluster.ClusterError('proxy nodes and subcollector nodes '
+                                       'are not disjoint, this should not '
+                                       'happen')
+
+    def __load_cluster_attributes(self):
+        """ Load important cluster parameters. """
+
+        # path where original flow records are stored
+        attribute_name = 'flow-original-path'
+        self.flow_original_path = get_cluster_attribute(attribute_name)
+        if not self.flow_original_path:
+            raise Cluster.ClusterError('cluster attribute "{}" is not defined'
+                                       .format(attribute_name))
+
+        # path where mirrored flow records are stored
+        attribute_name = 'flow-mirror-path'
+        self.flow_mirror_path = get_cluster_attribute(attribute_name)
+        if not self.flow_mirror_path:
+            raise Cluster.ClusterError('cluster attribute "{}" is not defined'
+                                       .format(attribute_name))
+
+    def __get_node_list(self):
+        """
+        crm_node: tool for displaying low-level node information
+            --list: print all known members (past and present) of this cluster
+
+        output:
+            <ID> <NAME> member
+            ...
+
+        return:
+            list of tuples (integer node ID, string name (usually hostname))
+        """
+
+        args = [EXECUTABLES['node'], '--list']
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                universal_newlines=True)
+        stdout_str, stderr_str = proc.communicate()
+        ret_code = proc.wait(SUBPROCESS_TIMEOUT)
+
+        if ret_code != 0 or stderr_str:
+            err_str = ('\ncommand: ' + ' '.join(args) + '\nreturn code: ' +
+                       str(ret_code) + '\nstderr:' + stderr_str)
+            raise subprocess.SubprocessError(err_str)
+
+        node_list = []
+        for match in re.findall(r'(\d+)\s+(\S+)', stdout_str):
+            node_list.append((int(match[0]), match[1]))
+
+        return node_list
+
+    def check_subcollector_topology(self):
+        """
+        Check validity of the subcollector topology: a graph consisting of a
+        single component forming a directed cycle.
+        """
+
+        if len(self.subcollector_nodes) == 0:
+            raise Cluster.ClusterError('no subcollector node found')
+
+        subcollectors = copy.copy(self.subcollector_nodes)
+        sub = sub_first = subcollectors.pop()  # return and remove
+        subcollectors.add(sub)  # put it back in
+
+        if sub_first == sub_first.successor:
+            raise Cluster.ClusterError('subcollector self-loop does not make '
+                                       'sense')
+
+        while sub.successor in subcollectors:
+            subcollectors.remove(sub.successor)  # remove the successor
+            sub = sub.successor  # move to the successor
+
+        # check if the last is also the first (cycle)
+        if sub != sub_first:
+            raise Cluster.ClusterError('subcollector graph does not form a '
+                                       'cycle')
+        # check if all we looped through all subcollectors (single component)
+        if subcollectors:
+            raise Cluster.ClusterError('subcollector graph contains more than '
+                                       'one component')
+
+    def subcollector_graph_str(self):
+        """ Print the subcollector topology graph. """
+
+        self.check_subcollector_topology()
+
+        first = min(self.subcollector_nodes, key=lambda sub: sub.id)
+        graph_str = str(first.id)
+
+        sub = first.successor
+        while sub != first:
+            graph_str += ' -> ' + str(sub.id)
+            sub = sub.successor
+        return graph_str
+
+    def update_status(self):
+        """
+        Without --hide-headers crm_mon also shows Last updated, but it is not
+        needed right now.
+
+        crm_mon: provides a summary of cluster's current state (online,
+                 offline, standby, ...)
+            --group-by-node: group resources by node
+            --hide-headers:  hide all headers (good for parsing)
+            --show-detail:   show more details (node IDs, individual clone
+                             instances)
+            --one-shot:      display the cluster status once on the console
+                             and exit (no ncurses)
+
+        output:
+            Node <NAME> (<ID>): <STATUS>
+            ...
+
+        return:
+            list of tuples (integer ID, string status)
+        """
+
+        args = [EXECUTABLES['mon'], '--group-by-node', '--hide-headers',
+                '--show-detail', '--one-shot']
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                universal_newlines=True)
+        stdout_str, stderr_str = proc.communicate()
+        ret_code = proc.wait(SUBPROCESS_TIMEOUT)
+
+        if ret_code != 0 or stderr_str:
+            err_str = ('\ncommand: ' + ' '.join(args) + '\nreturn code: '
+                       + str(ret_code) + '\nstderr:' + stderr_str)
+            raise subprocess.SubprocessError(err_str)
+
+        matches = re.findall(r'Node\s+(\S+)\s+\((\d+)\):\s+(\w+)', stdout_str)
+        if not matches:
+            raise Cluster.ClusterError('error while parsing the output of the '
+                                       'crm_mon command')
+        status_dict = dict()
+        for match in matches:
+            # 0 = node name, 1 = ID string, 2 = status string
+            node_id = int(match[1])
+            if node_id in status_dict:
+                raise Cluster.ClusterError('duplicate node IDs in the output '
+                                           'of the crm_mon command')
+            status_dict[node_id] = (match[0], match[2])
+
+        for node in self.proxy_nodes | self.subcollector_nodes:
+            name, node.status = status_dict[node.id]
+            if node.name != name:
+                raise Cluster.ClusterError('node name mismatch in the output '
+                                           'of the crm_mon command')
+
+    def get_online_nodes(self):
+        return {i for i in self.proxy_nodes | self.subcollector_nodes if
+                i.is_online()}
+
+    def get_online_proxy_nodes(self):
+        return {i for i in self.proxy_nodes if i.is_online()}
+
+    def get_online_subcollector_nodes(self):
+        return {i for i in self.subcollector_nodes if i.is_online()}
+
+    class ClusterError(Error):
+        """General Cluster exception.
+
+        Attributes:
+            message -- explanation of the error
+        """
+
+        def __init__(self, message):
+            self.message = message
+
+
+class Node(ABC):
+    """Abstract representation of a node in a flow processing cluster."""
+
+    @abstractmethod
+    def __init__(self, id, name):
+        self.id = int(id)
+        self.name = name
+        self.status = None
+
+    def __repr__(self):
+        return '{}(id={}, name={}, status={})'.format(type(self).__name__,
+                                                      self.id, self.name,
+                                                      self.status)
+
+    def is_online(self):
+        return self.status == 'online'
+
+
+class ProxyNode(Node):
+    """
+    Object representing a proxy node in a flow processing cluster.
+    """
+
+    def __init__(self, id, name):
+        super().__init__(id, name)
+
+
+class SubcollectorNode(Node):
+    """
+    Object representing a subcollector node in a flow processing cluster.
+    """
+
+    def __init__(self, id, name):
+        super().__init__(id, name)
+        self.successor = None
+        self.predecessor = None
+
+    def __repr__(self):
+        successor_id = self.successor.id if self.successor else None
+        predecessor_id = self.predecessor.id if self.predecessor else None
+        return '{}, successor.id={}, predecessor.id={})' \
+            .format(super().__repr__()[:-1], successor_id, predecessor_id)
 
 
 ###############################################################################
-def vprint_formatter(*args, **kwargs):
-    """Verbose-enabled print formatter."""
+def verbose_print_formatter(*args, **kwargs):
     print(OUTPUT_PREFIX, 'VERBOSE:', *args, **kwargs)
 
 
-def vprint_formatter_void(*args, **kwargs):
-    """Verbose-disabled print formatter."""
+def verbose_print_formatter_void(*args, **kwargs):
     pass
 
 
@@ -98,73 +365,11 @@ def myformatwarning(message, category, filename, lineno, line=None):
     return '{} WARNING: {}\n'.format(OUTPUT_PREFIX, str(message))
 
 
-def get_nodes_names():
-    """
-    crm_node: tool for displaying low-level node information
-        --list: print all known members (past and present) of this cluster
-
-    output:
-        <ID> <NAME> member
-        ...
-
-    return:
-        list of tuples (integer ID, string name)
-    """
-
-    args = [binaries['node'], '--list']
-    proc = subprocess.Popen(args, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, universal_newlines=True)
-    stdout_str, stderr_str = proc.communicate()
-    ret_code = proc.wait()
-
-    if ret_code != 0 or stderr_str:
-        err_str = ('\ncommand: ' + ' '.join(args) + '\nreturn code: ' +
-                   str(ret_code) + '\nstderr:' + stderr_str)
-        raise subprocess.SubprocessError(err_str)
-
-    node_list = []
-    for match in re.findall(r'(\d+)\s+(\S+)', stdout_str):
-        node_list.append((int(match[0]), match[1]))
-
-    return node_list
-
-
-def get_nodes_status():
-    """
-    crm_mon: provides a summary of cluster's current state (online,
-             offline, standby, ...)
-        --group-by-node: group resources by node
-        --hide-headers:  hide all headers (good for parsing)
-        --show-detail:   show more details (node IDs, individual clone
-                         instances)
-        --one-shot:      display the cluster status once on the console
-                         and exit (no ncurses)
-
-    output:
-        Node <NAME> (<ID>): <STATUS>
-        ...
-
-    return:
-        list of tuples (integer ID, string status)
-    """
-
-    args = [binaries['mon'], '--group-by-node', '--hide-headers',
-            '--show-detail', '--one-shot']
-    proc = subprocess.Popen(args, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, universal_newlines=True)
-    stdout_str, stderr_str = proc.communicate()
-    ret_code = proc.wait()
-
-    if ret_code != 0 or stderr_str:
-        err_str = ('\ncommand: ' + ' '.join(args) + '\nreturn code: '
-                   + str(ret_code) + '\nstderr:' + stderr_str)
-        raise subprocess.SubprocessError(err_str)
-
-    nodes_status = []
-    for match in re.findall(r'Node\s+\S+\s+\((\d+)\):\s+(\w+)', stdout_str):
-        nodes_status.append((int(match[0]), match[1]))
-
-    return nodes_status
+def check_executables():
+    """ Check presence of the defined executables. """
+    for key, value in EXECUTABLES.items():
+        if shutil.which(value) is None:
+            raise OSError('executable "{}" not found.'.format(value))
 
 
 def get_cluster_attribute(attribute_name, node_name=None):
@@ -182,14 +387,14 @@ def get_cluster_attribute(attribute_name, node_name=None):
         attribute value as string or None if no such attribute is set
     """
 
-    args = [binaries['attribute'], '--query',
+    args = [EXECUTABLES['attribute'], '--query',
             '--name={}'.format(attribute_name)]
     if node_name:
         args.append('--node={}'.format(node_name))
     proc = subprocess.Popen(args, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, universal_newlines=True)
     stdout_str, stderr_str = proc.communicate()
-    ret_code = proc.wait()
+    ret_code = proc.wait(SUBPROCESS_TIMEOUT)
 
     if ret_code != 0 or stderr_str:
         err_str = ('\ncommand: ' + ' '.join(args) + '\nreturn code: '
@@ -207,223 +412,22 @@ def get_cluster_attribute(attribute_name, node_name=None):
     return match.group(1)
 
 
-def load_nodes_dict():
-    """
-    {
-        ID: {
-                'name': NAME,
-                'successor': ID (only for subcollectors)
-            }
-
-        ID: ...
-    }
-    """
-
-    nodes_dict = {}
-    id_names = get_nodes_names()
-    ids = set()
-
-    for id, name in id_names:
-        nodes_dict[id] = {'name': name}
-        ids.add(id)
-
-    for id, name in id_names:
-        succ_id = get_cluster_attribute('successor', name)
-        if succ_id is None:
-            continue  # no successor attribute means node is not subcollector
-
-        succ_id = int(succ_id)
-        if succ_id not in ids:
-            raise KeyError('node "{}" has invalid successor id "{}".'.format(
-                           id, succ_id))
-        else:
-            nodes_dict[id]['successor'] = succ_id
-
-    return nodes_dict
-
-
-def load_setup_dict():
-    """Return dictionary with certain cluster parameters."""
-
-    setup_dict = {}
-
-    for attribute in ['flow-primary-brick', 'flow-backup-brick']:
-        value = get_cluster_attribute(attribute)
-        if value is None:
-            raise Exception('cluster attribute "{}" is not defined.'
-                            .format(attribute))
-        else:
-            setup_dict[attribute] = value
-
-    return setup_dict
-
-
-def get_master_set(nodes_dict):
-    """Return set of master nodes."""
-
-    masters = set()
-    for key, value in nodes_dict.items():
-        if 'successor' not in value:
-            masters.add(key)
-
-    return masters
-
-
-def get_subcollector_set(nodes_dict):
-    """Return set of subcollector nodes."""
-
-    subcollectors = set()
-    for key, value in nodes_dict.items():
-        if 'successor' in value:
-            subcollectors.add(key)
-
-    return subcollectors
-
-
-def get_online_set():
-    """Return set of online nodes."""
-
-    online_set = set()
-    for id, status in get_nodes_status():
-        if status == 'online':
-            online_set.add(id)
-
-    return online_set
-
-
-def graph_check_validity(nodes_dict):
-    """Check validity of the topology graph."""
-
-    subcoll_set = get_subcollector_set(nodes_dict)
-
-    if len(subcoll_set) == 0:
-        raise GraphError('empty subcollector set')
-
-    first_id = node_id = subcoll_set.pop()
-    succ_id = nodes_dict[node_id]['successor']
-
-    if node_id == succ_id:
-        warnings.warn('graph validity check: self-loop doesn\'t make sense')
-        return
-
-    while succ_id in subcoll_set:
-        subcoll_set.remove(succ_id)
-        node_id = succ_id
-        succ_id = nodes_dict[node_id]['successor']
-
-    if succ_id != first_id or len(subcoll_set) != 0:
-        raise GraphError('invalid subcollector graph')
-
-
-def graph_print(nodes_dict):
-    """Print VALID topology graph."""
-
-    subcoll_set = get_subcollector_set(nodes_dict)
-
-    # find first node
-    curr_id = subcoll_set.pop()
-    succ_id = nodes_dict[curr_id]['successor']
-    graph_str = '--> ' + nodes_dict[curr_id]['name']
-
-    while succ_id in subcoll_set:
-        subcoll_set.remove(succ_id)
-        curr_id = succ_id
-        succ_id = nodes_dict[curr_id]['successor']
-        graph_str += ' --> ' + nodes_dict[curr_id]['name']
-
-    bottom_line = '_' * len(graph_str)
-    graph_str += '--'
-    print(graph_str)
-    print('|' + bottom_line + '|')
-
-
-def construct_hosts_and_paths(nodes_dict, setup_dict):
-    """
-    """
-
-    master_name = ''
-    slave_names = []
-    paths = []
-
-    online_set = get_online_set()
-    master_set = get_master_set(nodes_dict)
-    subcollector_set = get_subcollector_set(nodes_dict)
-
-    # choose best master node
-    for master in master_set:
-        if master in online_set:
-            # we have a dedicated master node
-            master_name = nodes_dict[master]['name']
-            break
-    else:
-        # no dedicated master found, choose an arbitrary subcollector node as a
-        # master node
-        for sub in subcollector_set:
-            if sub in online_set:
-                    master_name = nodes_dict[sub]['name']
-                    break
-        else:  # no master found at all
-            raise Exception('no node suitable for master role found.')
-
-    # at least one online subcollector is mandatory
-    if subcollector_set.isdisjoint(online_set):
-        raise Exception('no online subcollector found.')
-
-    # add all online subcollector nodes as slaves
-    for sub in subcollector_set:
-        if sub in online_set:
-            slave_names.append(nodes_dict[sub]['name'])
-
-    # handle all not online subcollector nodes
-    for sub in subcollector_set:
-        if sub not in online_set:
-            sub_name = nodes_dict[sub]['name']
-            succ = nodes_dict[sub]['successor']
-            succ_name = nodes_dict[succ]['name']
-
-            warn_msg = 'run: node {} ({}) isn\'t online, '.format(sub,
-                                                                  sub_name)
-            if succ in online_set:
-                # successor is online, still change to have a complete data set
-                succ_idx = slave_names.index(succ_name) + 1
-                fdistdump_conv_spec = '%{}:'.format(succ_idx)
-                succ_path = os.path.join(
-                    fdistdump_conv_spec + setup_dict['flow-backup-brick'],
-                    sub_name)
-                paths.append(succ_path)
-                warn_msg += 'using successor {} ({}) as a backup' \
-                    .format(succ, succ_name)
-                warnings.warn(warn_msg)
-            else:
-                # successor is offline, data set will be incomplete
-                warn_msg += 'its successor {} ({}) also isn\'t online. ' \
-                    'Data set for this job is incomplete' \
-                    .format(succ, succ_name)
-                warnings.warn(warn_msg)
-
-    # prepend master node to slaves and append global primary path
-    slave_names.insert(0, master_name)
-    paths.append(os.path.join(setup_dict['flow-primary-brick'], '%h'))
-
-    return (slave_names, paths)
-
-
 def terminate_job(job_popen, timeout):
-    vprint('termination: sending SIGTERM')
+    verbose_print('termination: sending SIGTERM')
     job_popen.terminate()
     try:
         job_popen.wait(timeout)
     except subprocess.TimeoutExpired:
-        vprint('termination: SIGTERM did not work. Sending SIGKILL')
+        verbose_print('termination: SIGTERM did not work. Sending SIGKILL')
         job_popen.kill()
         try:
             job_popen.wait(timeout)
         except subprocess.TimeoutExpired:
-            vprint('termination: SIGKILL did not work, giving up')
+            verbose_print('termination: SIGKILL did not work, giving up')
         else:
-            vprint('termination: SIGKILL has terminated the job')
+            verbose_print('termination: SIGKILL has terminated the job')
     else:
-        vprint('termination: SIGTERM has terminated the job')
+        verbose_print('termination: SIGTERM has terminated the job')
 
 
 def signal_handler(signal, frame):
@@ -437,24 +441,23 @@ def signal_handler(signal, frame):
     responsibility to terminate the job -- first by SIGTERM, then by SIGKILL.
     """
 
-    warnings.warn('termination: received signal {}, terminating the job and '
+    warnings.warn('termination: received signal {}, terminating job and '
                   'exitting as soon as possible'.format(signal))
-    timeout = 5
 
     if ('mpi_job_proc' not in globals()
             or mpi_job_proc is None
             or mpi_job_proc.poll() is not None):
-        vprint('termination: job is not running, exiting immediately')
+        verbose_print('termination: job is not running, exiting immediately')
     else:
-        vprint('termination: job is running, waiting {} seconds for job to '
-               'self-terminate'.format(timeout))
+        verbose_print('termination: job is running, waiting {} seconds for '
+                      'the job to self-terminate'.format(SUBPROCESS_TIMEOUT))
         try:
-            mpi_job_proc.wait(timeout)
+            mpi_job_proc.wait(SUBPROCESS_TIMEOUT)
         except subprocess.TimeoutExpired:
-            vprint('termination: job did not self-terminate')
-            terminate_job(mpi_job_proc, timeout)
+            verbose_print('termination: the job did not self-terminate')
+            terminate_job(mpi_job_proc, SUBPROCESS_TIMEOUT)
         else:
-            vprint('termination: job has self-terminated')
+            verbose_print('termination: the job has self-terminated')
 
     sys.exit()  # only raises the SystemExit exception
 
@@ -462,13 +465,14 @@ def signal_handler(signal, frame):
 class ClusterHealthMonitor:
     """Cluster health monitoring class."""
 
-    def __init__(self, online_ref_set, nodes_dict):
+    def __init__(self, online_ref_set, termination_timeout, allowed_state):
         self.state = self.State()
         self.online_ref_set = online_ref_set
         self.online_set = online_ref_set
-        self.nodes_dict = nodes_dict
-        self.termination_timer = threading.Timer(
-            ha_args.termination_timeout.total_seconds(), self._terminate)
+        self.termination_timeout = termination_timeout
+        self.termination_timer = threading.Timer(self.termination_timeout,
+                                                 self._terminate)
+        self.allowed_state = allowed_state
         self.terminated = False
 
     def __del(self):
@@ -483,26 +487,24 @@ class ClusterHealthMonitor:
     def _terminate(self):
         warnings.warn('{}: time spent in the denied state exceeded its limit, '
                       'terminating the job'.format(type(self).__name__))
-        terminate_job(mpi_job_proc, 5)
+        terminate_job(mpi_job_proc, SUBPROCESS_TIMEOUT)
         self.terminated = True
 
     def update(self, online_set_new):
             # compare the current online node set to the previous one
             if online_set_new != self.online_set:
-                # one or more nodes went online, offline or combination
+                # one or more nodes went online, offline, or combination
                 online_superset = online_set_new - self.online_set
                 offline_superset = self.online_set - online_set_new
 
                 for node in online_superset:
-                    warnings.warn(
-                        '{}: node {} has upgraded to the online status'
-                        .format(type(self).__name__,
-                                self.nodes_dict[node]['name']))
+                    warnings.warn('{}: node {} has upgraded to the online '
+                                  'status'.format(type(self).__name__,
+                                                  node.name))
                 for node in offline_superset:
-                    warnings.warn(
-                        '{}: node {} has degraded from the online status'
-                        .format(type(self).__name__,
-                                self.nodes_dict[node]['name']))
+                    warnings.warn('{}: node {} has degraded from the online '
+                                  'status'.format(type(self).__name__,
+                                                  node.name))
 
             # compare the current online node set to the reference one
             online_superset = online_set_new - self.online_ref_set
@@ -513,16 +515,16 @@ class ClusterHealthMonitor:
             # check if the state has changed
             if self.state != state_new:
                 state_status = 'denied' if \
-                    self.state.is_denied(ha_args.allowed_state) else 'allowed'
+                    self.state.is_denied(self.allowed_state) else 'allowed'
                 state_new_status = 'denied' if \
-                    state_new.is_denied(ha_args.allowed_state) else 'allowed'
+                    state_new.is_denied(self.allowed_state) else 'allowed'
 
                 warnings.warn('{}: transition from the {} state <{}> to the '
                               '{} state <{}>'.format(type(self).__name__,
                                                      state_status, self.state,
                                                      state_new_status,
                                                      state_new))
-                if state_new.is_denied(ha_args.allowed_state):
+                if state_new.is_denied(self.allowed_state):
                     # transition to the denied state, start the timer
                     if not self.termination_timer.is_alive():
                         self.termination_timer.start()
@@ -530,8 +532,7 @@ class ClusterHealthMonitor:
                     # transition to the allowed state, cancel the timer
                     self.termination_timer.cancel()
                     self.termination_timer = threading.Timer(
-                        ha_args.termination_timeout.total_seconds(),
-                        self._terminate)
+                        self.termination_timeout, self._terminate)
 
             self.state.update(state_new)
             self.online_set = online_set_new
@@ -580,33 +581,91 @@ class ClusterHealthMonitor:
             self.message = message
 
 
-def run_job():
-    # load current cluster and nodes setup
-    setup_dict = load_setup_dict()
-    nodes_dict = load_nodes_dict()
+def run_job(ha_args, mpiexec_exec, mpiexec_args, priority_args, fdistdump_exec,
+            fdistdump_args, user_paths):
+    cluster = Cluster()
+    print(cluster)
 
-    # check the topology graph validity
-    graph_check_validity(nodes_dict)
+    online_proxy_nodes = cluster.get_online_proxy_nodes()
+    online_subcollector_nodes = cluster.get_online_subcollector_nodes()
 
-    # construct hosts and appropriate paths based on the current cluster status
-    hosts, base_paths = construct_hosts_and_paths(nodes_dict, setup_dict)
-    mpiexec_hosts = ','.join(hosts)  # comma separated hostnames
-    fdistdump_paths = []  # space separated paths
-    for base_path in base_paths:
-        fdistdump_paths += [shlex.quote(os.path.join(base_path, user_path))
-                            for user_path in user_paths]
+    # at least one online subcollector node is mandatory
+    if not online_subcollector_nodes:
+        raise Exception('no online subcollector node')
 
-    # get reference set of online nodes and run the job
-    subprocess_args = (mpiexec_argv + ['-host', mpiexec_hosts] + priority_args
-                       + fdistdump_argv + fdistdump_paths)
-    vprint('run:', ' '.join([shlex.quote(arg) for arg in subprocess_args]))
+    # choose the best master for the query -- a dedicated proxy node if we
+    # have one, an arbitrary online subcollector node otherwise
+    master_node = next(iter(online_proxy_nodes)) if online_proxy_nodes else \
+        next(iter(cluster.subcollector_nodes))
+    # mpiexec host string has to containt comma-separated hostnames
+    mpiexec_hostnames = [master_node.name]
+
+    # TODO
+    # mpiexec args executable pgmargs [ : args executable pgmargs ... ]
+
+    # fdistdump paths are contatenation of flow_original_path and/or
+    # flow_mirror_path with user specified user_paths
+    original_paths = [os.path.join(cluster.flow_original_path, user_path) for
+                      user_path in user_paths]
+    mirror_paths = [os.path.join(cluster.flow_mirror_path, user_path) for
+                    user_path in user_paths]
+
+    if cluster.subcollector_nodes == online_subcollector_nodes:
+        # all subcollectors are online, use the MPI Single Process Multiple
+        # Data (SPMD) model
+        mpiexec_hostnames += [sub.name for sub in online_subcollector_nodes]
+        local_args = priority_args + [fdistdump_exec] + fdistdump_args \
+            + original_paths
+    else:
+        # one or more subcollecors are offline, use the the MPI colon notation
+        # for Multiple Program Multiple Data (MPMD) model
+        # mpiexec -host node1,node2 \                        # global arguments
+        #     -n 1 fdistdump flow_original_path : \          # local arguments
+        #     -n 1 fdistdump flow_original_path flow_mirror_path
+        LOCAL_ARGS_CONST = ['-n', '1'] + priority_args + [fdistdump_exec] \
+            + fdistdump_args + original_paths
+        local_args = LOCAL_ARGS_CONST[:-1] + ['/fake/unused/path']
+
+        sub = first = min(cluster.subcollector_nodes, key=lambda sub: sub.id)
+        while True:
+            if sub.is_online():
+                mpiexec_hostnames.append(sub.name)
+
+                local_args.append(':')
+                local_args += LOCAL_ARGS_CONST
+
+                if not sub.predecessor.is_online():
+                    warnings.warn('node "{}" is not online, using the mirror '
+                                  'on node "{}" instead'
+                                  .format(sub.predecessor.name, sub.name))
+                    local_args += mirror_paths
+
+            sub = sub.successor  # move to the successor
+            if sub == first:
+                break
+
+    # construct global arguments for both healthy and sick cluster states
+    subprocess_args = [mpiexec_exec] + mpiexec_args \
+        + ['-host', ','.join(mpiexec_hostnames)]
+    # append local arguments specific for healthy/sick cluster states
+    subprocess_args += local_args
+
+    # launch the job
+    verbose_print('launching:', ' '.join([shlex.quote(arg) for arg in
+                                          subprocess_args]))
+    # Make sure stdin is not associated with the terminal. MPI process manager
+    # reads from stdin, which causes many problems (SIGTTIN used for background
+    # jobs, bash while read loop, etc.) and fdistdump does not need stdin.
     global mpi_job_proc
-    mpi_job_proc = subprocess.Popen(subprocess_args)
+    mpi_job_proc = subprocess.Popen(subprocess_args, stdin=subprocess.DEVNULL)
 
-    # start monitoring loop
-    with ClusterHealthMonitor(get_online_set(), nodes_dict) as chm:
+    # start the monitoring loop
+    interval = ha_args.health_monitoring_interval.total_seconds()
+    with ClusterHealthMonitor(cluster.get_online_nodes(), interval,
+                              ha_args.allowed_state) as chm:
         while mpi_job_proc.poll() is None:
-            chm.update(get_online_set())
+            cluster.update_status()
+            chm.update(cluster.get_online_nodes())
             time.sleep(ha_args.health_monitoring_interval.total_seconds())
         else:
             if chm.terminated:
@@ -642,11 +701,14 @@ def argument_type_timedelta(seconds_str):
 
 
 ###############################################################################
-if __name__ == "__main__":
+def main():
     ########################################
     # attach handler to SIGINT and SIGTERM for gracefull job termination
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+
+    # check if all needed executables are installed
+    check_executables()
 
     # set my format for warning print function
     warnings.formatwarning = myformatwarning
@@ -677,9 +739,11 @@ if __name__ == "__main__":
         fdistdump_argv = sys.argv[fdistdump_argv_idx:mpiexec_argv_idx]
     else:
         # abbreviated form without FDISTDUMP_ARGS
-        ha_argv = sys.argv
+        ha_argv = copy.copy(sys.argv)
         mpiexec_argv = [None]
         fdistdump_argv = [None]
+
+    ha_exec = ha_argv.pop(0)  # extract fdistdump-ha executable
 
     ########################################
     # parse fdistdump-ha's command line arguments
@@ -700,7 +764,7 @@ if __name__ == "__main__":
         'FDISTDUMP is either a name of or an absolute path to the '
         'fdistdump(1) command. In the first case, the command is located '
         'using the PATH environment variable. On some Fedora-based '
-        'distributions MPI binaries must be suffixed with a MPI_SUFFIX '
+        'distributions MPI executables must be suffixed with a MPI_SUFFIX '
         'environment variable (e.g., _openmpi for Open MPI or _mpich for '
         'MPICH). The default value is thus "fdistdump$MPI_SUFFIX" if '
         'MPI_SUFFIX is defined, "fdistdump" otherwise. It is identified as '
@@ -783,45 +847,51 @@ if __name__ == "__main__":
                         '"live/channels/smtp/2016/07/" if you want to '
                         'process all flow files belonging to profile "live", '
                         'channel "smtp" from July 2016.')
-    ha_args = parser.parse_args(ha_argv[1:])
+    ha_args = parser.parse_args(ha_argv)
 
     ########################################
     # validate and handle command line arguments
     # define verbose print function
-    vprint = vprint_formatter if ha_args.verbose else vprint_formatter_void
+    global verbose_print
+    if ha_args.verbose:
+        verbose_print = verbose_print_formatter
+    else:
+        verbose_print = verbose_print_formatter_void
 
     # construct and check mpiexec args, hosts are added later
-    if mpiexec_argv[0] is None:
-        mpiexec_argv[0] = 'mpiexec'
-        vprint('arguments: MPIEXEC is not defined, using default value "{}"'
-               .format(mpiexec_argv[0]))
-    elif shutil.which(mpiexec_argv[0]) is None:
+    mpiexec_exec = mpiexec_argv.pop(0)
+    if mpiexec_exec is None:
+        mpiexec_exec = 'mpiexec'
+        verbose_print('arguments: MPIEXEC is not defined, using default '
+                      'value "{}"'.format(mpiexec_exec))
+    elif shutil.which(mpiexec_exec) is None:
         raise ValueError('"{}" is not a valid mpiexec command (PATH '
-                         'lookup failed)'.format(mpiexec_argv[0]))
+                         'lookup failed)'.format(mpiexec_exec))
     if '-host' in mpiexec_argv:
         raise ValueError('arguments: mpiexec argument "-host" is forbidden')
     if '-wdir' not in mpiexec_argv:
         mpiexec_argv += ['-wdir', '/tmp/']
 
     # construct and check fdistdump args
-    if fdistdump_argv[0] is None:
+    fdistdump_exec = fdistdump_argv.pop(0)
+    if fdistdump_exec is None:
         mpi_suffix = os.environ.get('MPI_SUFFIX')
         if mpi_suffix is None:
-            fdistdump_argv[0] = 'fdistdump'
+            fdistdump_exec = 'fdistdump'
         else:
-            fdistdump_argv[0] = 'fdistdump' + mpi_suffix
-        vprint('arguments: FDISTDUMP is not defined, using default value "{}"'
-               .format(fdistdump_argv[0]))
+            fdistdump_exec = 'fdistdump' + mpi_suffix
+        verbose_print('arguments: FDISTDUMP is not defined, using default '
+                      'value "{}"'.format(fdistdump_exec))
     # test fdistdump command existence
-    if shutil.which(fdistdump_argv[0]) is None:
+    if shutil.which(fdistdump_exec) is None:
         # only warning, command may be valid on the remote nodes
         warnings.warn('arguments: "{}" is not a valid fdistdump command on '
                       'this node (PATH lookup failed)'
-                      .format(fdistdump_argv[0]))
+                      .format(fdistdump_exec))
 
-    vprint('arguments:', ha_argv[0], ha_argv[1:])
-    vprint('arguments:', mpiexec_argv[0], mpiexec_argv[1:])
-    vprint('arguments:', fdistdump_argv[0], fdistdump_argv[1:])
+    verbose_print('arguments:', ha_exec, ha_argv)
+    verbose_print('arguments:', mpiexec_exec, mpiexec_argv)
+    verbose_print('arguments:', fdistdump_exec, fdistdump_argv)
 
     # pick only relative paths from user arguments
     user_paths = []
@@ -832,7 +902,7 @@ if __name__ == "__main__":
         else:
             user_paths.append(path)
     if len(user_paths) == 0:
-        raise ValueError('arguments: no valid path')
+        raise ValueError('arguments: no valid path found')
 
     # handle priority classes
     if ha_args.priority == 'low':
@@ -845,9 +915,6 @@ if __name__ == "__main__":
         raise ValueError('arguments: invalid priority class "{}"'
                          .format(ha_args.priority))
 
-    # handle restarts
-    DOWN_LIMIT = datetime.timedelta(seconds=5)
-
     # handle denied states
     if ha_args.allowed_state:
         ha_args.allowed_state = ClusterHealthMonitor.State(
@@ -857,27 +924,29 @@ if __name__ == "__main__":
         ha_args.allowed_state = ClusterHealthMonitor.State()
 
     ########################################
-    mpi_job_proc = None  # make the subprocess object global for signal handler
+    # make the subprocess object global for the signal handler
+    mpi_job_proc = None
     tries = 0
     while True:
         tries += 1
         if ha_args.tries == 0:
-            vprint('run: try {}'.format(tries))
+            verbose_print('run: try {}'.format(tries))
         elif tries <= ha_args.tries:
-            vprint('run: try {}/{}'.format(tries, ha_args.tries))
+            verbose_print('run: try {}/{}'.format(tries, ha_args.tries))
         else:
             warnings.warn('run: no more tries, giving up')
             rc = None
             break
 
         try:
-            rc = run_job()
+            rc = run_job(ha_args, mpiexec_exec, mpiexec_argv, priority_args,
+                         fdistdump_exec, fdistdump_argv, user_paths)
         except ClusterHealthMonitor.ClusterHealthMonitorError:
             # cluster failure, try again with new cluster configuration
             continue
         else:
             # job success of failure, don't try again
-            vprint('run: job exit code = {}'.format(rc))
+            verbose_print('run: job exit code = {}'.format(rc))
             if rc < 0:
                 warnings.warn('run: job was terminated by a signal')
             elif rc > 0:
@@ -888,10 +957,15 @@ if __name__ == "__main__":
             if mpi_job_proc is not None and mpi_job_proc.poll() is None:
                 warnings.warn('run: job should not be running now, but it is. '
                               'Terminating')
-                terminate_job(mpi_job_proc, 5)
+                terminate_job(mpi_job_proc, SUBPROCESS_TIMEOUT)
 
     ########################################
     if rc is None:
         exit(-1)
     else:
         exit(rc)
+
+
+###############################################################################
+if __name__ == "__main__":
+    main()
