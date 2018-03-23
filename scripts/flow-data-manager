@@ -50,6 +50,9 @@ import shutil
 from pathlib import Path
 
 
+###############################################################################
+# global constants
+
 OUTPUT_PREFIX = os.path.basename(__file__).upper() if '__file__' in globals() \
     else 'DATA-MANAGER'
 
@@ -127,8 +130,8 @@ class Profile:
     def __repr__(self):
         return '{}(name={}, parent_obj={}, channels={}, subprofiles={})'\
             .format(type(self).__name__, self.base_path.name,
-                    self.parent_obj.base_path.name,
-                    self.channels, self.subprofiles)
+                    self.parent_obj.base_path.name if self.parent_obj else
+                    None, self.channels, self.subprofiles)
 
     def scan(self):
         """Scan profile's base directory and look for channels and subprofiles.
@@ -419,7 +422,7 @@ def vprint_formatter(*args, **kwargs):
         use_prefix = True
 
     if use_prefix:
-        print(OUTPUT_PREFIX, 'VERBOSE:', *args, **kwargs)
+        print(OUTPUT_PREFIX, 'Verbose:', *args, **kwargs)
     else:
         print(*args, **kwargs)
 
@@ -430,12 +433,20 @@ def vprint_formatter_void(*args, **kwargs):
 
 
 def myformatwarning(message, category, filename, lineno, line=None):
-    return '{} WARNING: {}\n'.format(OUTPUT_PREFIX, str(message))
+    return '{} Warning: {}\n'.format(OUTPUT_PREFIX, str(message))
 
 
 ###############################################################################
 def scan_main():
-    scan_nodes()
+    """Scan all given IPFIXcol profile directories."""
+    # recursively scan all given profile directories and create Profile objects
+    profiles = []
+    for profile_path in args.profile_path:
+        profile = Profile(profile_path, None)
+        profile.scan()
+        profiles.append(profile)
+
+    return profiles
 
 
 def scan_add_parser(subparsers):
@@ -451,40 +462,12 @@ def scan_check_args(args):
     return
 
 
-def scan_nodes():
-    # find node directories in the base path
-    vprint('base directory "{}" scan:'.format(base_path_arg), end=' ')
-    content_dict = dir_scan(base_path_arg)
-    vprint('using dirs: {}, ignoring files: {}'
-           .format(content_dict['dirs_n'], content_dict['others_n']),
-           use_prefix=False)
-    if not content_dict['dirs']:
-        raise Exception('node directory lookup: nothing appropriate found in '
-                        'the given directory')
-
-    # check if all node directories are placed on the same device
-    ref_st_dev = next(iter(content_dict['dirs'])).stat().st_dev
-    if not all(ref_st_dev == node_dir.stat().st_dev
-               for node_dir in content_dict['dirs']):
-        raise Exception('node directory lookup: one or more node directories '
-                        'are placed across different devices')
-
-    # scan all node directories and create profiles, recursively
-    nodes = []
-    for path in content_dict['dirs']:
-        node = Node(path)
-        node.scan()
-        nodes.append(node)
-
-    return nodes
-
-
 ###############################################################################
 def delete_main():
     rc = 0
 
     # check if used disk space is below the given upper bound
-    du_before = disk_usage(base_path_arg)
+    du_before = disk_usage(args.profile_path[0])
     if du_before[2] < args.du_boundary:
         vprint('nothing to do, used disk space ({:.2f} %) is below the disk '
                'usage boundary ({:.2f} %)'.format(du_before[2],
@@ -504,7 +487,7 @@ def delete_main():
             du_lower_list.append(args.du_lower_to)
         max_du_lower_to = max(du_lower_list)
 
-        statvfs = os.statvfs(str(base_path_arg))
+        statvfs = os.statvfs(str(args.profile_path[0]))
         now_used_blocks = statvfs.f_blocks - statvfs.f_bavail
         des_used_blocks = statvfs.f_blocks * (max_du_lower_to / 100)
         diff_blocks = now_used_blocks - des_used_blocks
@@ -526,11 +509,10 @@ def delete_main():
     # get a sorted list (earliest first) of all flow files from all channels
     all_files = []
     all_channels = set()
-    for node in scan_nodes():
-        for profile in node.profiles:
-            for channel in profile.get_channels(recursively=True):
-                all_channels.add(channel)
-                all_files += channel.flow_files
+    for profile in scan_main():
+        for channel in profile.get_channels(recursively=True):
+            all_channels.add(channel)
+            all_files += channel.flow_files
     all_files.sort()
 
     # unlink flow files from the list until certain stop condition is met
@@ -570,7 +552,7 @@ def delete_main():
     print('cleanup summary:    {} {} flow dir(s), {} empty dir(s)'
           .format('would remove' if args.dry_run else 'removed',
                   cleanup_counter, empty_counter))
-    du_after = disk_usage(base_path_arg)
+    du_after = disk_usage(args.profile_path[0])
     print('disk usage summary: '
           'before {}B ({:.2f} %), '
           'after {}B ({:.2f} %), '
@@ -849,9 +831,9 @@ def parse_args():
                         default=False,
                         help='Be verbose.')
 
-    parser.add_argument('base_path',
-                        nargs=1,
-                        help='Path to the flow storage directory.')
+    parser.add_argument('profile_path',
+                        nargs='+',
+                        help='Path to the IPFIXcol profile directory.')
 
     subparsers = parser.add_subparsers(title='subcommands',
                                        description='valid subcommands',
@@ -953,33 +935,44 @@ def lock_acquire(lock_file_path):
 
 
 ###############################################################################
-if __name__ == "__main__":
+def main():
     # set my format for warning print function
     warnings.formatwarning = myformatwarning
 
-    ########################################
     # parse command line arguments
+    global args
     args = parse_args()
-    # if args.subcommand_name != 'delete':
-    #     raise NotImplementedError('sub-command "{}" is not implemented yet'
-    #                               .format(args.subcommand_name))
 
     # define a verbose print function and a dry run print function
+    global vprint
     vprint = vprint_formatter if args.verbose else vprint_formatter_void
+    global dprint
     dprint = print
 
-    # check validity of a given base path
-    base_path_arg = Path(args.base_path[0])
-    if not base_path_arg.exists():
-        raise FileNotFoundError('"{}" does not exist'.format(base_path_arg))
-    if not base_path_arg.is_dir():
-        raise NotADirectoryError('"{}" does not point to a directory'
-                                 .format(base_path_arg))
+    # create Path objects from path strings
+    args.profile_path = [Path(i) for i in args.profile_path]
 
-    ########################################
-    # acquire file lock to prevent multiple instances running simultaneously
-    lock_acquire(Path(base_path_arg, LOCK_FILE_NAME))
+    # check if all given directories exist
+    for profile_path in args.profile_path:
+        if not profile_path.exists():
+            raise FileNotFoundError('"{}" does not exist'.format(profile_path))
+        if not profile_path.is_dir():
+            raise NotADirectoryError('"{}" does not point to a directory'
+                                     .format(profile_path))
+    # check if all given directories are placed on the same device
+    ref_st_dev = args.profile_path[0].stat().st_dev
+    if not all(ref_st_dev == profile_dir.stat().st_dev
+               for profile_dir in args.profile_path):
+        raise Exception('given directories are placed across different '
+                        'devices')
 
-    ########################################
+    #     # acquire lock to prevent multiple instances running simultaneously
+    #     lock_acquire(Path(base_path, LOCK_FILE_NAME))
+
     # do the real work
-    sys.exit(args.subcommand_func_main())
+    args.subcommand_func_main()
+
+
+###############################################################################
+if __name__ == "__main__":
+    main()
