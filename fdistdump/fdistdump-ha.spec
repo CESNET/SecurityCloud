@@ -1,7 +1,7 @@
 # preamble #####################################################################
 Name:           fdistdump-ha
 Version:        0.1.0
-Release:        1%{?dist}
+Release:        3%{?dist}
 Summary:        High availability wrapper for fdistdump
 
 License:        BSD
@@ -16,7 +16,9 @@ BuildRoot:      %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
 BuildArch:      noarch
 
 Requires:       python(abi) >= 3.4
-Requires:       fdistdump >= 0.4.0
+Requires:       fdistdump-common >= 0.4.0
+# the following is better, but requires newer rpm
+#Requires:       (fdistdump-mpich >= 0.4.0 or fdistdump-openmpi >= 0.4.0)
 Requires:       pacemaker-cli >= 1.1.16
 
 %description
@@ -38,5 +40,11 @@ rm -rf $RPM_BUILD_ROOT
 
 # changelog section ############################################################
 %changelog
+* Thu Mar 22 2018 Jan Wrona <wrona@cesnet.cz> - 0.1.0-3
+- Fix typo in Requires.
+
+* Thu Mar 22 2018 Jan Wrona <wrona@cesnet.cz> - 0.1.0-2
+- Fix Requires for fdistdump.
+
 * Thu Mar 22 2018 Jan Wrona <wrona@cesnet.cz> - 0.1.0-1
 - First vesrion of the specfile.
