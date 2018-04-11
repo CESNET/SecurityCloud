@@ -50,6 +50,7 @@ import warnings
 import shutil
 import shlex
 import copy
+import socket
 from abc import ABC, abstractmethod
 
 
@@ -584,7 +585,6 @@ class ClusterHealthMonitor:
 def run_job(ha_args, mpiexec_exec, mpiexec_args, priority_args, fdistdump_exec,
             fdistdump_args, user_paths):
     cluster = Cluster()
-    print(cluster)
 
     online_proxy_nodes = cluster.get_online_proxy_nodes()
     online_subcollector_nodes = cluster.get_online_subcollector_nodes()
@@ -593,15 +593,22 @@ def run_job(ha_args, mpiexec_exec, mpiexec_args, priority_args, fdistdump_exec,
     if not online_subcollector_nodes:
         raise Exception('no online subcollector node')
 
-    # choose the best master for the query -- a dedicated proxy node if we
-    # have one, an arbitrary online subcollector node otherwise
-    master_node = next(iter(online_proxy_nodes)) if online_proxy_nodes else \
-        next(iter(cluster.subcollector_nodes))
-    # mpiexec host string has to containt comma-separated hostnames
+    # choose a master for the query -- prefer local node over remote nodes and
+    # dedicated proxy nodes over subcollector nodes
+    fqdn = socket.getfqdn()
+    local_names = [fqdn, fqdn.partition('.')[0], socket.gethostname()]
+    for node in online_proxy_nodes | online_subcollector_nodes:
+        # select localhost, whether it is a proxy node or a subcollector node
+        if node.name in local_names:
+            master_node = node
+            break
+    else:
+        # select an arbitrary online proxy node or subcollector node
+        master_node = next(iter(online_proxy_nodes)) if online_proxy_nodes \
+            else next(iter(cluster.subcollector_nodes))
+        warnings.warn('using remote node "{}" as a master node'
+                      .format(master_node.name))
     mpiexec_hostnames = [master_node.name]
-
-    # TODO
-    # mpiexec args executable pgmargs [ : args executable pgmargs ... ]
 
     # fdistdump paths are contatenation of flow_original_path and/or
     # flow_mirror_path with user specified user_paths
